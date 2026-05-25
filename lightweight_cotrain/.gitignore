@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+
+models/
+
+training_log.txt
+training_log_15b.txt
+
+cotrain_checkpoints_math/
+cotrain_checkpoints_math_improved/
+cotrain_checkpoints_8g/
+cotrain_checkpoints_math_15b/
