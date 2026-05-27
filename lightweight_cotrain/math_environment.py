@@ -194,67 +194,158 @@ class MathEnvironment:
 
 class MathReward:
     """
-    数学环境的奖励函数
-    基于答案正确性
+    对齐 MrlX-DeepResearch 原始设计的奖励函数
+
+    核心原则：
+    1. 二值制格式检查 — 格式错误 → 0.0（无论答案对错）
+    2. Main Agent: 格式正确+答案正确→1.0，格式正确+答案错误→0.1
+    3. Sub Agent: 格式错误→0.0，格式正确→继承Main分数
+    4. 无平滑过渡 — 完全对齐原始设计
     """
+
+    FORMAT_SCORE = 0.1  # 格式正确但答案错误的安慰分
+
+    # ── 格式验证（状态机，对齐原始 MrlX） ──
+
+    @staticmethod
+    def _validate_main_format(text: str) -> bool:
+        """
+        Main Agent 状态机格式验证
+
+        要求: <thinking> → [tool_call] → <result>  严格顺序
+        标签成对，内容只能出现在标签内部，终态为 end
+        """
+        tags_to_check = ["thinking", "tool_call", "result"]
+        has_alt_tool = ("[tool_call]" in text and "[/tool_call]" in text)
+
+        for tag in tags_to_check:
+            if tag == "tool_call":
+                if has_alt_tool:
+                    continue
+                if f"<{tag}>" in text or f"</{tag}>" in text:
+                    if text.count(f"<{tag}>") != text.count(f"</{tag}>"):
+                        return False
+            else:
+                if text.count(f"<{tag}>") != text.count(f"</{tag}>"):
+                    return False
+
+        pattern = r"(</?(?:thinking|tool_call|result)>)"
+        if has_alt_tool:
+            pattern = r"(</?(?:thinking|tool_call|result)>|\[/?tool_call\])"
+
+        parts = re.split(pattern, text)
+        state = "start"
+
+        for part in parts:
+            if not part.strip():
+                continue
+
+            is_tag = re.match(r"</?(?:thinking|tool_call|result)>|\[/?tool_call\]", part)
+            if is_tag:
+                tag_str = part.strip()
+                if tag_str == "<thinking>" and state in ("start",):
+                    state = "in_thinking"
+                elif tag_str == "</thinking>" and state == "in_thinking":
+                    state = "after_thinking"
+                elif tag_str in ("<tool_call>", "[tool_call]") and state in ("start", "after_thinking"):
+                    state = "in_tool_call"
+                elif tag_str in ("</tool_call>", "[/tool_call]") and state == "in_tool_call":
+                    state = "after_tool_call"
+                elif tag_str == "<result>" and state in ("after_thinking", "after_tool_call"):
+                    state = "in_result"
+                elif tag_str == "</result>" and state == "in_result":
+                    state = "end"
+                else:
+                    return False
+            else:
+                if state not in ("in_thinking", "in_tool_call", "in_result"):
+                    return False
+
+        return state == "end"
+
+    @staticmethod
+    def _validate_sub_format(text: str) -> bool:
+        """
+        Sub Agent 状态机格式验证
+
+        要求: <thinking> → <result>  严格顺序
+        终态为 end
+        """
+        for tag in ["thinking", "result"]:
+            if text.count(f"<{tag}>") != text.count(f"</{tag}>"):
+                return False
+
+        pattern = r"(</?(?:thinking|result)>)"
+        parts = re.split(pattern, text)
+        state = "start"
+
+        for part in parts:
+            if not part.strip():
+                continue
+
+            is_tag = re.match(r"</?(?:thinking|result)>", part)
+            if is_tag:
+                tag_str = part.strip()
+                if tag_str == "<thinking>" and state == "start":
+                    state = "in_thinking"
+                elif tag_str == "</thinking>" and state == "in_thinking":
+                    state = "after_thinking"
+                elif tag_str == "<result>" and state in ("after_thinking", "start"):
+                    state = "in_result"
+                elif tag_str == "</result>" and state == "in_result":
+                    state = "end"
+                else:
+                    return False
+            else:
+                if state not in ("in_thinking", "in_result"):
+                    return False
+
+        return state == "end"
+
+    # ── 奖励计算（完全对齐原始 MrlX） ──
 
     @staticmethod
     def compute_main_reward(task: MathTask, main_response: str, sub_results: List[str]) -> float:
         """
-        Main Agent 奖励
-        1. 格式正确性（权重更高）
-        2. 子任务分解合理
-        3. 最终答案正确性（权重很高）
+        Main Agent 奖励 — 对齐原始 MrlX compute_score_em
         """
-        reward = 0.0
+        # 截断到最后一个 </result>，忽略后面的垃圾文本
+        last_result = main_response.rfind("</result>")
+        if last_result != -1:
+            main_response = main_response[:last_result + len("</result>")]
 
-        # 格式验证 - 奖励更高
-        has_thinking = "<thinking>" in main_response and "</thinking>" in main_response
-        has_tool_call = "<tool_call>" in main_response and "</tool_call>" in main_response
-        has_result = "<result>" in main_response and "</result>" in main_response
-        
-        if has_thinking:
-            reward += 2.0
-        if has_tool_call:
-            reward += 2.0
-        if has_result:
-            reward += 3.0
+        is_valid_format = MathReward._validate_main_format(main_response)
 
-        # 子任务分解
-        if sub_results:
-            reward += min(len(sub_results) * 1.0, 2.0)
+        if not is_valid_format:
+            return 0.0
 
-        # 尝试从 Main Agent 响应中提取最终答案
         pred = MathEnvironment.extract_number(main_response)
-        if pred is not None:
-            acc_reward = MathEnvironment.compute_accuracy_reward(pred, task.answer)
-            reward += acc_reward * 3.0  # 答案正确性权重更高
 
-        return reward
+        if pred is None:
+            return MathReward.FORMAT_SCORE
+
+        if MathEnvironment.check_answer(pred, task.answer):
+            return 1.0
+        else:
+            return MathReward.FORMAT_SCORE
 
     @staticmethod
     def compute_sub_reward(subtask: str, sub_response: str, main_score: float, task_answer: float) -> float:
         """
-        Sub Agent 奖励
-        1. 格式正确性（权重更高）
-        2. 计算结果正确性
-        3. 继承 Main Agent 评分
+        Sub Agent 奖励 — 对齐原始 MrlX sub_agent_multiturn.reward_func
         """
-        reward = 0.0
+        last_result = sub_response.rfind("</result>")
+        if last_result != -1:
+            sub_response = sub_response[:last_result + len("</result>")]
 
-        # 格式验证
-        if "<thinking>" in sub_response and "</thinking>" in sub_response:
-            reward += 2.0
-        if "<result>" in sub_response and "</result>" in sub_response:
-            reward += 2.0
+        is_valid_format = MathReward._validate_sub_format(sub_response)
 
-        # 尝试提取计算结果
-        pred = MathEnvironment.extract_number(sub_response)
-        if pred is not None:
-            acc_reward = MathEnvironment.compute_accuracy_reward(pred, task_answer)
-            reward += acc_reward * 2.0
+        if not is_valid_format:
+            return 0.0
 
-        # 继承 Main Agent 的奖励（协同信号）
-        reward += main_score * 0.3
-
-        return reward
+        if main_score == 0.0:
+            return MathReward.FORMAT_SCORE
+        elif main_score <= MathReward.FORMAT_SCORE:
+            return MathReward.FORMAT_SCORE
+        else:
+            return 1.0

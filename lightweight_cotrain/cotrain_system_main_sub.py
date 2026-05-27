@@ -15,6 +15,7 @@ Sub Agent (执行者): 接收子任务，执行并返回结果
 """
 
 import os
+import sys
 import json
 import re
 import torch
@@ -47,11 +48,11 @@ class CoTrainConfig:
     batch_size: int = 2
     group_size: int = 4
     max_subtasks: int = 3
-    max_response_len: int = 2048
+    max_response_len: int = 512  # 限制响应长度防止废话
 
     # GRPO 配置
     eps_clip: float = 0.2
-    kl_coef: float = 0.05
+    kl_coef: float = 0.5  # 强力KL惩罚防止模型崩溃
 
     # 训练频率
     sync_interval: int = 50
@@ -321,7 +322,7 @@ class SharedModel:
                 all_advantages.append(advantages[i][j])
                 all_old_logprobs.append(old_logprobs[i][j])
 
-        batch_compute_size = 4
+        batch_compute_size = 1
         new_logprobs_list = []
 
         for start in range(0, len(all_prompts), batch_compute_size):
@@ -331,6 +332,7 @@ class SharedModel:
 
             logprobs = self.compute_logprobs(adapter_name, batch_prompts, batch_responses, requires_grad=True)
             new_logprobs_list.append(logprobs)
+            self.model.zero_grad(set_to_none=True)
 
         new_logprobs = torch.cat(new_logprobs_list, dim=0)
         old_logprobs_tensor = torch.stack(all_old_logprobs).to(self.device)
@@ -414,19 +416,32 @@ class CoTrainSystemOptimized:
             print(f"[系统] 卸载后显存: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
     def build_main_prompt(self, task: MathTask) -> str:
-        """构建 Main Agent 的 prompt"""
         system_msg = (
-            "You are a math problem solver. Your goal is to break down math problems into steps.\n"
-            "Use the following format:\n"
-            "<thinking>Your reasoning process</thinking>\n"
-            "<tool_call>subtask=\"specific calculation step\"</tool_call>\n"
-            "After receiving results, provide the final answer:\n"
-            "<result>Your final numerical answer</result>\n"
-            "Important: The final answer must be a number."
+            "你是数学解题器。按如下格式输出，不要遗漏任何部分：\n\n"
+            "<thinking>\n"
+            "简要分析问题\n"
+            "</thinking>\n"
+            "[tool_call]\n"
+            "计算的具体内容，如: 计算 61 × 19\n"
+            "[/tool_call]\n"
+            "<result>\n"
+            "数字答案\n"
+            "</result>\n\n"
+            "示例 - 输入: 长方形的长6宽3，面积?\n"
+            "示例 - 输出:\n"
+            "<thinking>\n"
+            "面积=长×宽\n"
+            "</thinking>\n"
+            "[tool_call]\n"
+            "计算 6 × 3\n"
+            "[/tool_call]\n"
+            "<result>\n"
+            "18\n"
+            "</result>"
         )
         messages = [
             {"role": "system", "content": system_msg},
-            {"role": "user", "content": f"Problem: {task.question}\nPlan and solve:"}
+            {"role": "user", "content": f"问题: {task.question}"}
         ]
 
         prompt = self.shared_model.tokenizer.apply_chat_template(
@@ -435,16 +450,19 @@ class CoTrainSystemOptimized:
         return prompt
 
     def build_sub_prompt(self, subtask: str) -> str:
-        """构建 Sub Agent 的 prompt"""
         system_msg = (
-            "You are a task executor. Your goal is to complete the given subtask.\n"
-            "Use the following format:\n"
-            "<thinking>Your reasoning process</thinking>\n"
-            "<result>Your answer to the subtask</result>"
+            "你是一个计算执行器。你的任务是执行给定的计算子任务并返回精确的数字结果。\n\n"
+            "格式要求：\n"
+            "<thinking>简要写出你的计算过程</thinking>\n"
+            "<result>数字答案</result>\n\n"
+            "规则：\n"
+            "1. 只执行被分配的具体计算，不要分析原问题\n"
+            "2. <result> 中必须只包含数字，不要带单位或解释文字\n"
+            "3. 如果子任务是乘法，直接算出来；是加减法，直接算出来"
         )
         messages = [
             {"role": "system", "content": system_msg},
-            {"role": "user", "content": f"Subtask: {subtask}\nExecute:"}
+            {"role": "user", "content": f"计算任务: {subtask}\n请执行并给出结果:"}
         ]
 
         prompt = self.shared_model.tokenizer.apply_chat_template(
@@ -453,7 +471,6 @@ class CoTrainSystemOptimized:
         return prompt
 
     def parse_main_response(self, response: str) -> Tuple[str, List[str]]:
-        """解析 Main Agent 的响应"""
         thinking = ""
         subtasks = []
 
@@ -461,27 +478,50 @@ class CoTrainSystemOptimized:
         if thinking_match:
             thinking = thinking_match.group(1).strip()
         else:
-            thinking = response[:100].strip()
+            lines = response.strip().split("\n")
+            thinking = "\n".join(lines[:3]).strip()[:200]
 
-        subtask_matches = re.findall(r'<tool_call>subtask="(.*?)"</tool_call>', response)
-        if subtask_matches:
-            subtasks = subtask_matches
-        else:
-            numbered = re.findall(r'(?:^|\n)\s*\d+\.\s*(.+?)(?=\n\s*\d+\.|\n\s*[-\*]\s|$)', response, re.DOTALL)
-            if numbered:
-                subtasks = [s.strip() for s in numbered if len(s.strip()) > 5]
-            else:
-                bullets = re.findall(r'(?:^|\n)\s*[-\*]\s*(.+?)(?=\n\s*[-\*]\s|$)', response, re.DOTALL)
-                if bullets:
-                    subtasks = [s.strip() for s in bullets if len(s.strip()) > 5]
-                else:
-                    if len(response.strip()) > 10:
-                        subtasks = [response.strip()[:200]]
+        patterns = [
+            (r"<tool_call[^>]*>(.*?)</tool_call>", 1),
+            (r"\[tool_call\]\s*(.*?)\s*\[/tool_call\]", 1),
+            (r"\[tool_call\]\s*(.*?)(?=\[|$)", 1),
+            (r"<tool_call[^>]*>(.*?)(?=<|$)", 1),
+        ]
+        for pat, group in patterns:
+            blocks = re.findall(pat, response, re.DOTALL)
+            if blocks:
+                for block in blocks:
+                    st = block.strip()
+                    st = re.sub(r"subtask\s*[:：]\s*", "", st, flags=re.IGNORECASE).strip()
+                    st = re.sub(r"```.*?```", "", st, flags=re.DOTALL).strip()
+                    st = re.sub(r"<[^>]+>.*?</[^>]+>", "", st, flags=re.DOTALL).strip()
+                    if 5 < len(st) < 300 and "<thinking>" not in st:
+                        subtasks.append(st)
+                if subtasks:
+                    break
+
+        if not subtasks:
+            for line in response.split("\n"):
+                line = line.strip()
+                for pat in [r"计算\s*.+", r"[Cc]alculate\s*.+", r"[Cc]ompute\s*.+"]:
+                    m = re.search(pat, line)
+                    if m:
+                        st = m.group(0).strip()
+                        if 5 < len(st) < 200:
+                            subtasks.append(st)
+                            break
+                if subtasks:
+                    break
+
+        if not subtasks and len(response.strip()) > 20:
+            fallback = re.sub(r"<thinking>.*?</thinking>", "", response, flags=re.DOTALL).strip()
+            fallback = re.sub(r"<[^>]+>.*?</[^>]+>", "", fallback, flags=re.DOTALL).strip()
+            if len(fallback) > 10:
+                subtasks = [fallback[:200]]
 
         return thinking, subtasks
 
     def parse_sub_response(self, response: str) -> Tuple[str, str]:
-        """解析 Sub Agent 的响应"""
         thinking = ""
         result = ""
 
@@ -489,11 +529,15 @@ class CoTrainSystemOptimized:
         if thinking_match:
             thinking = thinking_match.group(1).strip()
 
-        result_match = re.search(r"<result>(.*?)</result>", response, re.DOTALL)
+        result_match = re.search(r"<result>\s*(-?\d+\.?\d*)\s*</result>", response)
         if result_match:
             result = result_match.group(1).strip()
         else:
-            result = response.strip()
+            last_number = re.findall(r'-?\d+\.?\d*', response)
+            if last_number:
+                result = last_number[-1]
+            else:
+                result = response.strip()[:50]
 
         return thinking, result
 
@@ -535,7 +579,7 @@ class CoTrainSystemOptimized:
                 if queue_item:
                     sub_prompt = self.build_sub_prompt(queue_item["subtask"])
                     sub_resp_list, sub_lengths = self.shared_model.generate(
-                        SharedModel.SUB_ADAPTER, [sub_prompt], max_new_tokens=1024
+                        SharedModel.SUB_ADAPTER, [sub_prompt], max_new_tokens=100
                     )
                     sub_response = sub_resp_list[0]
                     sub_response_lengths.extend(sub_lengths)
@@ -574,15 +618,17 @@ class CoTrainSystemOptimized:
     def train(self, tasks: List[MathTask], num_iterations: int = 50):
         """主训练循环 - 优化版：每轮只加载一次"""
         print(f"[系统] 开始训练，共 {num_iterations} 轮...")
+        print(f"[系统] 使用 {len(tasks)} 道固定训练题")
         print(f"[系统] 设备: {self.config.device}")
         print(f"[系统] 优化：单模型 + 多LoRA + 每轮只加载一次")
+
+        self._load_model()
 
         for iteration in range(num_iterations):
             print(f"\n{'='*50}")
             print(f"=== Iteration {iteration + 1}/{num_iterations} ===")
             print(f"{'='*50}")
-
-            self._load_model()
+            sys.stdout.flush()
 
             print(f"\n[系统] 收集 {len(tasks)} 个任务的 rollout 数据...")
 
@@ -704,9 +750,198 @@ class CoTrainSystemOptimized:
                     SharedModel.SUB_ADAPTER,
                     str(self.save_dir / f"lora_sub_step_{iteration + 1}")
                 )
+                
+                # 评估测试集泛化能力
+                _test_tasks = getattr(self, '_test_tasks', None)
+                if _test_tasks:
+                    test_correct = 0
+                    for tt in _test_tasks:
+                        _, _, main_rewards, _, _, _ = self.run_episode(tt, group_size=1)
+                        if main_rewards:
+                            best_main = main_rewards[0]
+                            test_correct += int(best_main >= 5)
+                    acc = test_correct / len(_test_tasks)
+                    print(f"[评估] 测试集泛化准确率: {acc:.2%} ({test_correct}/{len(test_tasks)})")
 
+        self._unload_model()
+        print("\n[系统] 训练完成！")
+
+    def train_with_eval(
+        self, train_tasks: List[MathTask], test_tasks: List[MathTask],
+        num_iterations: int = 50, eval_interval: int = 20,
+        num_train_tasks_per_iter: int = 5
+    ):
+        """带评估的训练循环 - 防止过拟合"""
+        import random
+        
+        print(f"[系统] 开始训练，共 {num_iterations} 轮...")
+        print(f"[系统] 每 {eval_interval} 轮评估一次测试集")
+        print(f"[系统] 每轮随机从 {len(train_tasks)} 道训练题中抽取 {num_train_tasks_per_iter} 道")
+        print(f"[系统] 设备: {self.config.device}")
+        print(f"[系统] 优化：单模型 + 多LoRA + 每轮只加载一次")
+        
+        rng = random.Random(42)
+        
+        for iteration in range(num_iterations):
+            print(f"\n{'='*50}")
+            print(f"=== Iteration {iteration + 1}/{num_iterations} ===")
+            print(f"{'='*50}")
+            
+            self._load_model()
+            
+            # 随机采样本轮训练任务
+            current_train_tasks = rng.sample(train_tasks, min(num_train_tasks_per_iter, len(train_tasks)))
+            print(f"\n[系统] 收集 {len(current_train_tasks)} 个任务的 rollout 数据...")
+            
+            all_main_samples = []
+            all_sub_samples = []
+            all_main_lengths = []
+            all_sub_lengths = []
+            
+            for task in current_train_tasks:
+                main_dialogues, sub_dialogues, main_rewards, sub_rewards, main_lengths, sub_lengths = self.run_episode(
+                    task, group_size=self.config.group_size
+                )
+                all_main_lengths.extend(main_lengths)
+                all_sub_lengths.extend(sub_lengths)
+                
+                main_prompts = [d["prompt"] for d in main_dialogues]
+                main_responses = [d["response"] for d in main_dialogues]
+                old_lp_main = self.shared_model.compute_logprobs(
+                    SharedModel.MAIN_ADAPTER, main_prompts, main_responses
+                )
+                
+                for k in range(len(main_dialogues)):
+                    all_main_samples.append({
+                        "prompt": main_dialogues[k]["prompt"],
+                        "response": main_dialogues[k]["response"],
+                        "reward": main_rewards[k],
+                        "old_logprob": old_lp_main[k].item(),
+                    })
+                
+                for d in sub_dialogues:
+                    old_lp_sub = self.shared_model.compute_logprobs(
+                        SharedModel.SUB_ADAPTER, [d["prompt"]], [d["response"]]
+                    )
+                    all_sub_samples.append({
+                        "prompt": d["prompt"],
+                        "response": d["response"],
+                        "reward": d["reward"],
+                        "old_logprob": old_lp_sub[0].item(),
+                    })
+            
+            print(f"[系统] Rollout 完成。样本: Main={len(all_main_samples)}, Sub={len(all_sub_samples)}")
+            
+            # 打印平均响应长度
+            if all_main_lengths:
+                avg_main_len = sum(all_main_lengths) / len(all_main_lengths)
+                max_main_len = max(all_main_lengths)
+                min_main_len = min(all_main_lengths)
+                print(f"[统计] Main Agent - 平均: {avg_main_len:.1f} tokens, 最大: {max_main_len}, 最小: {min_main_len}, 限制: {self.config.max_response_len}")
+            
+            if all_sub_lengths:
+                avg_sub_len = sum(all_sub_lengths) / len(all_sub_lengths)
+                max_sub_len = max(all_sub_lengths)
+                min_sub_len = min(all_sub_lengths)
+                print(f"[统计] Sub Agent  - 平均: {avg_sub_len:.1f} tokens, 最大: {max_sub_len}, 最小: {min_sub_len}, 限制: 1024")
+            
+            metrics = {}
+            
+            if all_main_samples:
+                for start in range(0, len(all_main_samples), self.config.batch_size):
+                    batch = all_main_samples[start:start + self.config.batch_size]
+                    if len(batch) < 2:
+                        continue
+                    
+                    prompts = [s["prompt"] for s in batch]
+                    responses = [[s["response"]] for s in batch]
+                    rewards = [[s["reward"]] for s in batch]
+                    old_logprobs = [torch.tensor([s["old_logprob"]]) for s in batch]
+                    
+                    metrics_main = self.shared_model.grpo_step(
+                        SharedModel.MAIN_ADAPTER,
+                        prompts,
+                        responses,
+                        rewards,
+                        old_logprobs,
+                    )
+                    metrics["main"] = metrics_main
+            
+            if all_sub_samples:
+                for start in range(0, len(all_sub_samples), self.config.batch_size):
+                    batch = all_sub_samples[start:start + self.config.batch_size]
+                    if len(batch) < 2:
+                        continue
+                    
+                    prompts = [s["prompt"] for s in batch]
+                    responses = [[s["response"]] for s in batch]
+                    rewards = [[s["reward"]] for s in batch]
+                    old_logprobs = [torch.tensor([s["old_logprob"]]) for s in batch]
+                    
+                    metrics_sub = self.shared_model.grpo_step(
+                        SharedModel.SUB_ADAPTER,
+                        prompts,
+                        responses,
+                        rewards,
+                        old_logprobs,
+                    )
+                    metrics["sub"] = metrics_sub
+            
+            if metrics:
+                if "main" in metrics:
+                    mm = metrics["main"]
+                    print(f"\n[结果] Main Agent - Loss: {mm['loss']:.4f}, "
+                          f"Policy: {mm['policy_loss']:.4f}, "
+                          f"KL: {mm['kl_penalty']:.4f}, "
+                          f"Reward: {mm['mean_reward']:.4f}")
+                if "sub" in metrics:
+                    ms = metrics["sub"]
+                    print(f"[结果] Sub Agent  - Loss: {ms['loss']:.4f}, "
+                          f"Policy: {ms['policy_loss']:.4f}, "
+                          f"KL: {ms['kl_penalty']:.4f}, "
+                          f"Reward: {ms['mean_reward']:.4f}")
+            
+            # 评估测试集
+            if (iteration + 1) % eval_interval == 0:
+                print(f"\n{'='*50}")
+                print(f"=== 评估测试集 ({len(test_tasks)} 道题) ===")
+                print(f"{'='*50}")
+                
+                test_main_rewards = []
+                test_sub_rewards = []
+                test_correct = 0
+                
+                for task in test_tasks:
+                    main_dialogues, sub_dialogues, main_rewards, sub_rewards, _, _ = self.run_episode(
+                        task, group_size=1
+                    )
+                    test_main_rewards.extend(main_rewards)
+                    test_sub_rewards.extend(sub_rewards)
+                    
+                    predicted = MathReward.extract_number(main_dialogues[-1]["response"])
+                    if predicted is not None and abs(predicted - task.answer) < 1e-2:
+                        test_correct += 1
+                
+                avg_test_main_reward = sum(test_main_rewards) / len(test_main_rewards) if test_main_rewards else 0
+                avg_test_sub_reward = sum(test_sub_rewards) / len(test_sub_rewards) if test_sub_rewards else 0
+                test_accuracy = test_correct / len(test_tasks)
+                
+                print(f"\n[评估] Main 平均 Reward: {avg_test_main_reward:.2f}")
+                print(f"[评估] Sub 平均 Reward: {avg_test_sub_reward:.2f}")
+                print(f"[评估] 最终答案准确率: {test_accuracy:.2%} ({test_correct}/{len(test_tasks)})")
+                
+                print("\n[系统] 同步权重...")
+                self.shared_model.save_lora_weights(
+                    SharedModel.MAIN_ADAPTER,
+                    str(self.save_dir / f"lora_main_step_{iteration + 1}")
+                )
+                self.shared_model.save_lora_weights(
+                    SharedModel.SUB_ADAPTER,
+                    str(self.save_dir / f"lora_sub_step_{iteration + 1}")
+                )
+            
             self._unload_model()
-
+        
         print("\n[系统] 训练完成！")
 
 
@@ -717,11 +952,11 @@ if __name__ == "__main__":
         lora_alpha=32,
         lr=5e-5,
         batch_size=2,
-        group_size=4,
+        group_size=2,
         max_subtasks=2,
-        max_response_len=2048,
-        sync_interval=50,
-        save_dir="./cotrain_checkpoints_math_15b",
+        max_response_len=128,  # 进一步限制响应长度，防止垃圾输出
+        sync_interval=20,
+        save_dir="./cotrain_checkpoints_math_15b_v2",
         use_4bit=False,
         device="cuda:0" if torch.cuda.is_available() else "cpu",
     )
@@ -733,12 +968,21 @@ if __name__ == "__main__":
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     env = MathEnvironment(seed=42)
-    tasks = env.sample_tasks(5)
+    all_tasks = env.tasks
+    rng_indices = torch.randperm(len(all_tasks), generator=torch.Generator().manual_seed(42)).tolist()
+    train_tasks = [all_tasks[i] for i in rng_indices[:40]]
+    test_tasks = [all_tasks[i] for i in rng_indices[40:]]
 
-    print(f"\n[系统] 数学环境已创建，共 {len(env.tasks)} 道题")
-    print(f"[系统] 使用 {len(tasks)} 道题进行训练")
+    print(f"\n[系统] 数学环境已创建，共 {len(all_tasks)} 道题")
+    print(f"[系统] 训练集: {len(train_tasks)} 道 | 测试集: {len(test_tasks)} 道")
+
+    # 从训练集中选10道固定训练题（避免随机采样导致的RL不稳定）
+    tasks = train_tasks[:5]
+    print(f"[系统] 使用 5 道固定训练题（简洁奖励 + 长度限制）")
+
     for i, t in enumerate(tasks[:3]):
-        print(f"  题{i+1}: {t.question} (答案: {t.answer})")
+        print(f"  示例题{i+1}: {t.question} (答案: {t.answer})")
 
     system = CoTrainSystemOptimized(config, env=env)
+    system._test_tasks = test_tasks
     system.train(tasks, num_iterations=200)
