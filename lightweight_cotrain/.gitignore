@@ -26,6 +26,8 @@ hotpotqa_mas_sub*/
 hotpotqa_mas_enhanced_*/
 hotpotqa_sub_pref*/
 hotpotqa_sft_checkpoints*/
+hotpotqa_dynamic_mas_*sft_*/
+hotpotqa_dynamic_mas_*continued_*/
 
 # Evaluation output directories; summaries are captured in reports
 hotpotqa_*_eval_*/

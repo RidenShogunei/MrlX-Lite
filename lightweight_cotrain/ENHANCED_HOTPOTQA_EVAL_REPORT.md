@@ -742,3 +742,74 @@ tool_valid = 1.000
 3. 再评估 direct_rate / avg_subtasks 是否真的动态化。
 4. 最后接 dynamic GRPO。
 ```
+## Dynamic MAS SFT Continuation
+
+New artifacts:
+```text
+hotpotqa_dynamic_mas_sft_data.jsonl
+hotpotqa_dynamic_mas_sft_continued_500x1/
+hotpotqa_dynamic_mas_mainonly_sft_500x1/
+```
+
+Training data:
+```text
+500 enhanced HotpotQA train tasks
+3000 SFT samples total
+1000 Main samples
+2000 Sub samples
+max_subtasks = 2
+direct_fraction = 0.0
+```
+
+Continuation runs:
+```text
+joint dynamic SFT:
+  start main = hotpotqa_mas_enhanced_mainonly_conservative_50x1/best/main
+  start sub  = hotpotqa_mas_enhanced_mainonly_conservative_50x1/best/sub
+  epochs     = 1
+  lr         = 5e-5
+  main loss  = 0.1322
+  sub loss   = 0.0557
+
+main-only dynamic SFT:
+  start main = hotpotqa_mas_enhanced_mainonly_conservative_50x1/best/main
+  sub frozen = hotpotqa_mas_enhanced_mainonly_conservative_50x1/best/sub
+  epochs     = 1
+  lr         = 5e-5
+  main loss  = 0.1295
+```
+
+Dynamic protocol eval, val offset 0, 20 hard tasks, 2 samples:
+| Model | direct_rate | avg_subtasks | tool_valid | answer_f1 | evidence | reward | best_answer_f1 | best_reward |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Staged best, dynamic fallback | 0.000 | 1.000 | 1.000 | 0.315 | 0.400 | 0.400 | 0.422 | 0.496 |
+| Joint dynamic SFT | 0.000 | 1.850 | 1.000 | 0.347 | 0.475 | 0.438 | 0.417 | 0.502 |
+| Main-only dynamic SFT + frozen best Sub | 0.000 | 1.825 | 1.000 | 0.293 | 0.487 | 0.402 | 0.404 | 0.493 |
+
+Fixed MAS protocol eval, same 20 hard tasks, 2 samples:
+| Model | answer_f1 | evidence | reward | best_answer_f1 | best_reward |
+|---|---:|---:|---:|---:|---:|
+| Staged best | 0.456 | 0.537 | 0.527 | 0.574 | 0.617 |
+| Joint dynamic SFT | 0.376 | 0.537 | 0.470 | 0.397 | 0.493 |
+| Main-only dynamic SFT + frozen best Sub | 0.359 | 0.450 | 0.441 | 0.450 | 0.520 |
+
+Interpretation:
+```text
+1. Dynamic SFT successfully teaches Main to emit multiple subtasks:
+   avg_subtasks improves from 1.000 fallback to about 1.8.
+2. Joint dynamic SFT is the best current dynamic-protocol checkpoint on this small eval.
+3. However, both dynamic SFT variants underperform staged best under the old fixed MAS protocol.
+4. Main-only dynamic SFT is not sufficient. Sub input distribution changes when Main emits focused per-document subtasks.
+5. Training Sub helps dynamic protocol reward, but it also perturbs the fixed-protocol summary distribution.
+```
+
+Current decision:
+```text
+Keep staged best as the production/baseline checkpoint.
+Use joint dynamic SFT only as a prototype checkpoint for dynamic MAS research.
+The next real improvement should be dynamic SFT with replay/mixture:
+  - preserve old fixed MAS plan/answer samples
+  - preserve enhanced Sub preference/SFT samples
+  - add dynamic multi-subtask samples
+Then evaluate dynamic and fixed protocols together before any dynamic GRPO.
+```
