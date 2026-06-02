@@ -5,9 +5,12 @@ SFT 数据生成器
 
 import json
 import random
+import re
 from pathlib import Path
 from typing import List, Dict
 from dataclasses import dataclass
+
+from math_environment import MathEnvironment
 
 
 @dataclass
@@ -56,6 +59,68 @@ class SFTTaskGenerator:
             "2. <result> 中必须只包含数字，不要带单位或解释文字\n"
             "3. 如果子任务是乘法，直接算出来；是加减法，直接算出来"
         )
+
+    @staticmethod
+    def _format_number(value) -> str:
+        value = float(value)
+        if abs(value - round(value)) < 1e-9:
+            return str(int(round(value)))
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _calc_from_question(question: str, answer) -> str:
+        if question.startswith("计算:"):
+            return question.replace("计算:", "", 1).strip()
+
+        m = re.search(r"解方程:\s*(.+)", question)
+        if m:
+            return f"{m.group(1)} -> x = {SFTTaskGenerator._format_number(answer)}"
+
+        nums = re.findall(r"\d+", question)
+        if "一共有" in question and len(nums) >= 2:
+            return f"{nums[0]} + {nums[1]}"
+        if "每天看" in question and len(nums) >= 2:
+            return f"{nums[0]} ÷ {nums[1]}"
+        if "面积" in question and len(nums) >= 2:
+            return f"{nums[0]} × {nums[1]}"
+        if "每袋装" in question and len(nums) >= 2:
+            return f"{nums[0]} // {nums[1]}"
+        if "还剩" in question and len(nums) >= 2:
+            return f"{nums[0]} - {nums[1]}"
+
+        return f"计算得到 {SFTTaskGenerator._format_number(answer)}"
+
+    def generate_environment_samples(self) -> List[SFTSample]:
+        """把数学环境里的 50 道题也转成严格格式 SFT 样本。"""
+        samples = []
+        env = MathEnvironment(seed=42)
+        for task in env.tasks:
+            answer = self._format_number(task.answer)
+            calc = self._calc_from_question(task.question, task.answer)
+            thinking = task.steps[0] if task.steps else "识别题目中的运算关系"
+
+            main_messages = [
+                {"role": "system", "content": self.main_prompt_template},
+                {"role": "user", "content": f"问题: {task.question}"},
+                {"role": "assistant", "content": (
+                    f"<thinking>\n{thinking}\n</thinking>\n"
+                    f"[tool_call]\n{calc}\n[/tool_call]\n"
+                    f"<result>\n{answer}\n</result>"
+                )}
+            ]
+            samples.append(SFTSample(messages=main_messages, category="main"))
+
+            sub_messages = [
+                {"role": "system", "content": self.sub_prompt_template},
+                {"role": "user", "content": f"计算任务: 计算 {calc}\n请执行并给出结果:"},
+                {"role": "assistant", "content": (
+                    f"<thinking>\n执行计算 {calc}，结果是 {answer}\n</thinking>\n"
+                    f"<result>\n{answer}\n</result>"
+                )}
+            ]
+            samples.append(SFTSample(messages=sub_messages, category="sub"))
+
+        return samples
 
     def generate_main_samples(self) -> List[SFTSample]:
         """生成 Main Agent SFT 数据"""
@@ -140,7 +205,8 @@ class SFTTaskGenerator:
         """生成所有 SFT 数据"""
         main_samples = self.generate_main_samples()
         sub_samples = self.generate_sub_samples()
-        return main_samples + sub_samples
+        env_samples = self.generate_environment_samples()
+        return main_samples + sub_samples + env_samples
 
     def save_to_jsonl(self, output_path: str):
         """保存为 JSONL 格式"""

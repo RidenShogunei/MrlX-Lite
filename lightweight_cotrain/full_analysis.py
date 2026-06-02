@@ -34,56 +34,41 @@ class CheckpointEntry:
 def define_checkpoints() -> List[CheckpointEntry]:
     """定义所有要评估的 checkpoint"""
     entries = []
+    seen_paths = set()
 
-    # ===== 基线 0: 纯基础模型 =====
     entries.append(CheckpointEntry(
         "0-基础模型(无训练)", "", "Baseline", "cn", "none"
     ))
 
-    # ===== 基线 1: SFT 格式训练 =====
-    entries.append(CheckpointEntry(
-        "1-SFT格式训练(Main)", "./sft_checkpoints/main_agent/main",
-        "Baseline", "cn", "SFT"
-    ))
-    entries.append(CheckpointEntry(
-        "1-SFT格式训练(Sub)", "./sft_checkpoints/sub_agent/sub",
-        "Baseline", "cn", "SFT"
-    ))
+    def add_entry(name: str, path: str, experiment: str, mode: str, stage: str):
+        normalized = str(Path(path)) if path else ""
+        if normalized in seen_paths:
+            return
+        seen_paths.add(normalized)
+        entries.append(CheckpointEntry(name, normalized, experiment, mode, stage))
 
-    # ===== 实验 A: SFT + 平滑奖励 GRPO (v4) =====
-    for step in [5, 10, 15, 20]:
-        lp = f"./sft_grpo_v4/main_step_{step}/main"
-        if os.path.exists(lp):
-            entries.append(CheckpointEntry(
-                f"A-GRPO平滑step{step}", lp,
-                "A-平滑奖励GRPO", "cn", f"step_{step}"
-            ))
+    known_paths = [
+        ("1-SFT格式训练(Main)", "./sft_checkpoints/main_agent/main", "Baseline", "cn", "SFT"),
+        ("1-SFT格式训练(Sub)", "./sft_checkpoints/sub_agent/sub", "Baseline", "cn", "SFT"),
+        ("D-原始协同step20", "./cotrain_checkpoints_math_15b/lora_main_step_20/main", "D-原始协同训练", "cn", "step_20"),
+    ]
+    for name, path, experiment, mode, stage in known_paths:
+        if os.path.exists(path):
+            add_entry(name, path, experiment, mode, stage)
 
-    # ===== 实验 B: MrlX 二进制奖励 (从SFT初始) =====
-    for step in [10, 20]:
-        lp = f"./sft_grpo_v3/main_step_{step}/main"
-        if os.path.exists(lp):
-            entries.append(CheckpointEntry(
-                f"B-MrlX二值step{step}(SFT初始)", lp,
-                "B-MrlX从SFT", "cn", f"step_{step}"
-            ))
-
-    # ===== 实验 C: MrlX 二进制奖励 (从基础模型初始) =====
-    for step in [5, 10]:
-        lp = f"./grpo_mrlx_v2/main_step_{step}/main"
-        if os.path.exists(lp):
-            entries.append(CheckpointEntry(
-                f"C-MrlX二值step{step}(基础)", lp,
-                "C-MrlX从零", "en_suffix", f"step_{step}"
-            ))
-
-    # ===== 实验 D: 原始 CoTrain (COT format) =====
-    lp = "./cotrain_checkpoints_math_15b_v2/lora_main_step_20/main"
-    if os.path.exists(lp):
-        entries.append(CheckpointEntry(
-            f"D-原始协同step20", lp,
-            "D-原始协同训练", "cn", "step_20"
-        ))
+    for root, experiment, mode in [
+        ("./sft_grpo_v4", "A-平滑奖励GRPO", "cn"),
+        ("./sft_grpo_v3", "B-MrlX从SFT", "cn"),
+        ("./grpo_mrlx_v2", "C-MrlX从零", "en_suffix"),
+        ("./cotrain_checkpoints_math", "CoTrain-0.5B", "cn"),
+        ("./cotrain_checkpoints_math_15b", "CoTrain-1.5B", "cn"),
+        ("./cotrain_checkpoints_math_improved", "CoTrain-improved", "cn"),
+    ]:
+        for adapter_config in sorted(Path(root).glob("**/adapter_config.json")) if Path(root).exists() else []:
+            lora_path = str(adapter_config.parent)
+            name = f"{experiment}:{adapter_config.parent.parent.name}/{adapter_config.parent.name}"
+            stage = adapter_config.parent.parent.name
+            add_entry(name, lora_path, experiment, mode, stage)
 
     return entries
 
@@ -110,7 +95,9 @@ class ModelLoader:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        if lora_path and os.path.exists(lora_path):
+        if lora_path:
+            if not os.path.exists(lora_path):
+                raise FileNotFoundError(f"LoRA checkpoint not found: {lora_path}")
             model = PeftModel.from_pretrained(model, lora_path, adapter_name="default")
 
         self.cached_model = model
@@ -156,29 +143,27 @@ def build_prompt(tokenizer, task: MathTask, mode: str) -> str:
     return prompt
 
 
-def generate_one(model, tokenizer, prompt: str, max_tokens: int = 128) -> str:
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+def generate_one(model, tokenizer, prompt: str, max_tokens: int = 128,
+                 response_prefix: str = "", canonicalize: bool = False) -> str:
+    inputs = tokenizer(prompt + response_prefix, return_tensors="pt", truncation=True, max_length=2048)
     inputs = {k: v.to("cuda:0") for k, v in inputs.items()}
     with torch.no_grad():
         out = model.generate(
             **inputs, max_new_tokens=max_tokens,
-            temperature=0.8, top_p=0.95, do_sample=True,
+            temperature=0.6, top_p=0.9, repetition_penalty=1.05, do_sample=True,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
     plen = inputs["input_ids"].shape[1]
-    raw = tokenizer.decode(out[0][plen:], skip_special_tokens=True).strip()
+    raw = response_prefix + tokenizer.decode(out[0][plen:], skip_special_tokens=True).strip()
     raw = re.sub(r'<\|im_start\|>.*?\n?', '', raw)
     raw = re.sub(r'<\|im_end\|>', '', raw).strip()
-    return raw
+    raw = MathReward.truncate_at_first_result(raw).strip()
+    return MathReward.canonicalize_main_response(raw) if canonicalize else raw
 
 
 def analyze_response(response: str, task: MathTask) -> Dict:
-    last = response.rfind("</result>")
-    if last >= 0:
-        clean = response[:last + len("</result>")]
-    else:
-        clean = response
+    clean = MathReward.truncate_at_first_result(response)
 
     is_valid = MathReward._validate_main_format(clean)
     reward = MathReward.compute_main_reward(task, clean, [])
@@ -205,7 +190,7 @@ def analyze_response(response: str, task: MathTask) -> Dict:
 
 def evaluate_checkpoint(entry: CheckpointEntry, test_tasks: List[MathTask],
                         loader: ModelLoader, n_samples: int = 8) -> Dict:
-    print(f"\n  📊 [{entry.name}] ...", end="")
+    print(f"\n  [Eval] [{entry.name}] ...", end="")
     model, tokenizer = loader.load(entry.lora_path)
     all_results = []
 
@@ -213,7 +198,13 @@ def evaluate_checkpoint(entry: CheckpointEntry, test_tasks: List[MathTask],
         prompt = build_prompt(tokenizer, task, entry.prompt_mode)
         task_results = []
         for _ in range(n_samples):
-            resp = generate_one(model, tokenizer, prompt)
+            resp = generate_one(
+                model,
+                tokenizer,
+                prompt,
+                response_prefix="<thinking>",
+                canonicalize=True,
+            )
             ar = analyze_response(resp, task)
             task_results.append(ar)
         all_results.append(task_results)
@@ -271,7 +262,7 @@ def evaluate_checkpoint(entry: CheckpointEntry, test_tasks: List[MathTask],
             "best_reward": t_best_r,
         })
 
-    print(f" ✅ 状态机={state_valid:.1%} 正确率={correct_rate:.1%} "
+    print(f" [OK] 状态机={state_valid:.1%} 正确率={correct_rate:.1%} "
           f"avgR={avg_reward:.3f} bestR={best_reward:.3f}")
 
     return {
@@ -303,11 +294,11 @@ def print_header(title: str, width: int = 78):
 
 
 def print_summary_table(all_eval: List[Dict]):
-    print_header("📈 汇总对比表")
+    print_header("汇总对比表")
     hdr = (f"  {'实验/阶段':<28} {'状态机':>7} {'thinking':>9} {'tool':>7} "
            f"{'result':>8} {'正确率':>7} {'BestN':>6} {'平均R':>7} {'满分题':>6}")
     print(hdr)
-    print("  " + "─" * (len(hdr) - 2))
+    print("  " + "-" * (len(hdr) - 2))
 
     for er in all_eval:
         n = er["name"]
@@ -318,7 +309,7 @@ def print_summary_table(all_eval: List[Dict]):
 
 
 def print_reward_distribution(all_eval: List[Dict]):
-    print_header("📊 奖励分布变化")
+    print_header("奖励分布变化")
     for er in all_eval:
         hist = er["reward_hist"]
         total = er["n_samples"]
@@ -326,40 +317,40 @@ def print_reward_distribution(all_eval: List[Dict]):
         for key in ["0.00", "0.10", "0.10<r<1.0", "1.00"]:
             cnt = hist.get(key, 0)
             pct = cnt / total * 100
-            bar = "█" * int(pct / 2)
+            bar = "#" * int(pct / 2)
             parts.append(f"{key}:{cnt:>3}({pct:4.1f}%){bar}")
         print(f"  {er['name']:<30} {' | '.join(parts)}")
 
 
 def print_correctness_trend(all_eval: List[Dict]):
-    print_header("📈 准确率 & 奖励趋势")
+    print_header("准确率 & 奖励趋势")
     for metric, label in [("correct_rate", "答案正确率"), ("avg_reward", "平均MrlX奖励"),
                            ("state_valid_rate", "状态机格式通过率")]:
         print(f"\n  {label}:")
         max_v = max(er[metric] for er in all_eval) if all_eval else 1
         for er in all_eval:
             v = er[metric]
-            bar = "█" * int(v / max(max_v, 0.01) * 40)
+            bar = "#" * int(v / max(max_v, 0.01) * 40)
             print(f"    {er['name']:<30} {v:.3f}  {bar}")
 
 
 def print_per_task_breakdown(all_eval: List[Dict], test_tasks: List[MathTask]):
     """展示每道题在各 checkpoint 下的表现"""
-    print_header("📋 逐题对比 (Best-of-N 奖励)")
+    print_header("逐题对比 (Best-of-N 奖励)")
 
     # Header
     row_hdr = "  " + "题目".ljust(40) + " "
     for er in all_eval:
         row_hdr += f"{er['stage_label']:>9} "
     print(row_hdr)
-    print("  " + "─" * (len(row_hdr) - 2))
+    print("  " + "-" * (len(row_hdr) - 2))
 
     for i, task in enumerate(test_tasks):
         row = f"  [{i+1}] {task.question[:37].ljust(37)} "
         for er in all_eval:
             if i < len(er["per_task"]):
                 br = er["per_task"][i]["best_reward"]
-                sym = "🟢" if br >= 1.0 else ("🟡" if br >= 0.1 else "🔴")
+                sym = "G" if br >= 1.0 else ("Y" if br >= 0.1 else "R")
                 row += f"{sym}{br:.2f}   "
             else:
                 row += "  N/A    "
@@ -367,7 +358,7 @@ def print_per_task_breakdown(all_eval: List[Dict], test_tasks: List[MathTask]):
 
 
 def print_improvement_summary(all_eval: List[Dict]):
-    print_header("🏆 关键发现")
+    print_header("关键发现")
 
     if len(all_eval) < 2:
         return
@@ -387,15 +378,15 @@ def print_improvement_summary(all_eval: List[Dict]):
         if er["state_valid_rate"] > 0.95 and er["correct_rate"] > 0.7:
             pareto.append(er)
     if pareto:
-        print(f"\n  ✅ 格式+准确率双优 ({len(pareto)} 个):")
+        print(f"\n  [OK] 格式+准确率双优 ({len(pareto)} 个):")
         for p in pareto:
-            print(f"     • {p['name']}: 格式={p['state_valid_rate']:.1%} 正确率={p['correct_rate']:.1%} "
+            print(f"     - {p['name']}: 格式={p['state_valid_rate']:.1%} 正确率={p['correct_rate']:.1%} "
                   f"BestN={p['best_of_n_acc']:.1%} 满分={p['perfect_tasks']}/{p['n_tasks']}")
     else:
-        print(f"\n  ⚠️ 无checkpoint同时满足格式>95%和正确率>70%")
+        print(f"\n  [WARN] 无checkpoint同时满足格式>95%和正确率>70%")
 
     # 最优推荐
-    print(f"\n  💡 推荐 checkpoint 排名:")
+    print(f"\n  推荐 checkpoint 排名:")
     scored = []
     for er in all_eval:
         # 综合评分 = 正确率 × 0.5 + 最佳奖励 × 0.3 + 状态机通过率 × 0.2
@@ -409,7 +400,7 @@ def print_improvement_summary(all_eval: List[Dict]):
 
 def print_experiment_comparison(all_eval: List[Dict]):
     """按实验组对比"""
-    print_header("🔬 实验组间对比")
+    print_header("实验组间对比")
 
     groups = defaultdict(list)
     for er in all_eval:
@@ -434,7 +425,7 @@ def print_experiment_comparison(all_eval: List[Dict]):
 
 def main():
     print("=" * 78)
-    print("  🔬 MrlX-GRPO 完整实验分析报告")
+    print("  MrlX-GRPO 完整实验分析报告")
     print("=" * 78)
     print(f"  PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}")
     print(f"  基础模型: Qwen2.5-1.5B-Instruct")
@@ -458,7 +449,7 @@ def main():
             er = evaluate_checkpoint(entry, test_tasks, loader, n_samples=8)
             all_eval.append(er)
         except Exception as e:
-            print(f"  ❌ 失败: {e}")
+            print(f"  [FAIL] 失败: {e}")
 
     # ===== 输出报告 =====
     print_summary_table(all_eval)
@@ -479,7 +470,7 @@ def main():
     print(f"\n  📄 报告已保存: {report_path}")
 
     print(f"\n{'='*78}")
-    print(f"  ✅ 分析完成！")
+    print(f"  [OK] 分析完成！")
     print(f"{'='*78}")
 
 

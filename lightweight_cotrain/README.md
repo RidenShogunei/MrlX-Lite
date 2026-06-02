@@ -1,92 +1,72 @@
-# 轻量级多智能体协同训练系统
+# 轻量级 MrlX 协同训练实验
 
-基于 MrlX 原理的简化复刻，使用 Qwen2.5-0.5B + LoRA，单卡 8GB 可跑。
+这是一个基于 MrlX 思路的本地轻量复刻，用 Qwen2.5 + LoRA 验证 Main Agent / Sub Agent 在数学任务上的格式约束、奖励设计和协同训练稳定性。
 
-## 架构
+当前代码更偏研究原型，不是完整框架。仓库只跟踪源码、SFT 数据和分析文档；模型与 checkpoint 目录被 `.gitignore` 排除。
 
-```
-Main Agent (任务分解)     Sub Agent (子任务执行)
-    |                              |
-    v                              v
-  LoRA 训练                     LoRA 训练
-    |                              |
-    +--------------+  +------------+
-                   |  |
-                   v  v
-              数学任务环境
-                   |
-                   v
-            双边奖励计算
-                   |
-                   v
-            GRPO 训练循环
-```
+## 项目结构
 
-## 文件说明
+| 文件 | 作用 |
+| --- | --- |
+| `math_environment.py` | 生成数学任务、抽取答案、检查格式、计算 Main/Sub 奖励 |
+| `generate_sft_data.py` | 生成 Main/Sub 格式化 SFT 数据到 `sft_data.jsonl` |
+| `sft_trainer.py` | 训练 Main/Sub LoRA 格式适配器，默认输出到 `sft_checkpoints/` |
+| `grpo_v4.py` | 从 SFT adapter 出发，做 Best-of-N + 高奖励样本更新 |
+| `cotrain_system_main_sub.py` | 更完整的 Main -> Sub 协同训练实验脚本 |
+| `analyze_results.py` | 对 SFT/GRPO checkpoint 做基础评估 |
+| `full_analysis.py` | 自动发现本地 LoRA checkpoint 并做多阶段评估 |
+| `ANALYSIS_REPORT.md` | 既有实验结论与问题分析 |
 
-| 文件 | 说明 |
-|------|------|
-| `cotrain_system_main_sub.py` | 主训练程序（Main → Sub 任务分解模式） |
-| `math_environment.py` | 数学任务环境（题目生成、答案验证、奖励计算） |
-| `README.md` | 本文档 |
-
-## 快速开始
+## 环境
 
 ```bash
-cd lightweight_cotrain
-
-# 安装依赖
-pip install torch transformers peft accelerate
-
-# 运行训练
-python cotrain_system_main_sub.py
+pip install -r requirements.txt
 ```
 
-首次运行需下载 Qwen2.5-0.5B-Instruct 模型（约 1GB），脚本会自动从 ModelScope 下载。
+如启用 4bit 量化，还需要安装与本机 CUDA 匹配的 `bitsandbytes`。
 
-## 配置参数
+## 模型路径
 
-在 `cotrain_system_main_sub.py` 末尾修改：
+主要脚本默认使用：
 
-```python
-config = CoTrainConfig(
-    main_model="./models/qwen/Qwen2___5-0___5B-Instruct",
-    sub_model="./models/qwen/Qwen2___5-0___5B-Instruct",
-    lora_r=8,                # LoRA rank
-    lora_alpha=16,           # LoRA alpha
-    lr=5e-4,                 # 学习率
-    batch_size=2,            # 训练 batch size
-    group_size=2,            # GRPO group 大小
-    max_subtasks=2,          # 最多分解几个子任务
-    max_response_len=256,    # 最大生成长度
-    rollout_interval=1,      # 每几轮收集一次 rollout
-    sync_interval=5,         # 每几轮同步保存权重
-    save_dir="./cotrain_checkpoints_math",
-    use_4bit=False,          # 是否启用 4bit 量化
-    device="cuda:0",
-)
+```text
+./models/qwen/Qwen2___5-1___5B-Instruct
 ```
 
-## 训练流程
+旧实验目录里也有 0.5B checkpoint。运行脚本前请确认对应模型已经下载到 `models/` 下，或在脚本里的 `CoTrainConfig.base_model` 中改成实际路径。
 
-1. **Rollout 阶段**：加载两个 Agent，在数学环境上收集交互数据
-2. **训练阶段**：卸载 Agent → 重新加载 → 执行 GRPO 策略更新
-3. **同步阶段**：每 `sync_interval` 轮保存 LoRA 权重
+## 推荐流程
 
-## 硬件需求
+1. 生成 SFT 数据：
 
-| 配置 | 显存占用 | 说明 |
-|------|---------|------|
-| 单卡 8GB | ~2GB | 两个 0.5B + LoRA，时间片切换 |
+```bash
+python generate_sft_data.py
+```
 
-## 与原版 MrlX 的对比
+2. 训练 Main/Sub SFT adapter：
 
-| 特性 | 原版 MrlX | 本轻量版 |
-|------|----------|---------|
-| 训练框架 | Megatron-LM + slime | Transformers + 自定义循环 |
-| 推理服务 | SGLang | Transformers generate |
-| Agent 关系 | 多角色协作 | Main → Sub 任务分解 |
-| 分布式 | Ray + 多容器 | 本机单进程 |
-| 最小模型 | 8B | 0.5B |
-| 最小 GPU | 8× H20 | 单卡 8GB |
-| 外部 API | 多个必须 | 无（自包含奖励函数） |
+```bash
+python sft_trainer.py
+```
+
+3. 从 SFT adapter 继续跑 GRPO v4：
+
+```bash
+python grpo_v4.py
+```
+
+4. 评估本地已有 checkpoint：
+
+```bash
+python full_analysis.py
+```
+
+`full_analysis.py` 会自动跳过不存在的历史目录，并扫描当前存在的 LoRA adapter。
+
+## 当前实验结论摘要
+
+- 平滑奖励能提升答案正确率，但容易让模型学会丢掉 XML/工具调用格式。
+- MrlX 式二值奖励更强调格式，但在小模型、小 batch、无强 KL 约束时信号稀疏，训练容易崩。
+- SFT 数据与 GRPO prompt 的格式必须完全一致，否则会出现“有答案、没格式、奖励全零”的情况。
+- 最需要继续改进的是奖励函数、KL/参考模型约束、SFT 数据覆盖和 checkpoint 评估脚本的一致性。
+

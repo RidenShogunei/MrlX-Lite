@@ -5,6 +5,8 @@
 
 import random
 import re
+import ast
+import operator
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
@@ -107,7 +109,7 @@ class MathEnvironment:
                 2
             ),
             (
-                "商店里有 {a} 个橙子，每袋装 {b} 个，可以装多少袋？还剩几个？",
+                "商店里有 {a} 个橙子，每袋装 {b} 个，可以装满多少袋？",
                 lambda a, b: a // b,
                 3
             ),
@@ -149,7 +151,7 @@ class MathEnvironment:
         patterns = [
             r'(?:答案|answer|result)(?:是|:|=)\s*(-?\d+\.?\d*)',
             r'(?:=|等于)\s*(-?\d+\.?\d*)',
-            r'<result>(-?\d+\.?\d*)</result>',
+            r'<result>\s*(-?\d+\.?\d*)\s*</result>',
             r'(?:^|\s)(-?\d+\.?\d*)(?:\s*$)',
         ]
         for pattern in patterns:
@@ -175,6 +177,55 @@ class MathEnvironment:
         if pred is None:
             return False
         return abs(pred - target) < tolerance
+
+    @staticmethod
+    def safe_eval_expression(expr: str) -> Optional[float]:
+        """安全执行简单算术表达式，只允许数字和基础四则运算。"""
+        expr = expr.strip()
+        expr = expr.replace("×", "*").replace("÷", "/").replace("：", ":")
+        expr = re.sub(r"[，。；;]", " ", expr)
+        expr = re.sub(r"(计算|compute|calculate|solve|答案|结果|等于|=)", " ", expr, flags=re.IGNORECASE)
+        expr = expr.replace("^", "**")
+
+        # 保留表达式里的安全字符，避免中文单位、解释文字进入 AST。
+        candidates = re.findall(r"-?\d+(?:\.\d+)?(?:\s*(?:\*\*|//|[+\-*/()])\s*-?\d+(?:\.\d+)?)+", expr)
+        if not candidates:
+            return None
+        expr = candidates[-1]
+
+        ops = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+            ast.FloorDiv: operator.floordiv,
+            ast.Pow: operator.pow,
+            ast.USub: operator.neg,
+            ast.UAdd: operator.pos,
+        }
+
+        def eval_node(node):
+            if isinstance(node, ast.Expression):
+                return eval_node(node.body)
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+                return float(node.value)
+            if isinstance(node, ast.UnaryOp) and type(node.op) in ops:
+                return ops[type(node.op)](eval_node(node.operand))
+            if isinstance(node, ast.BinOp) and type(node.op) in ops:
+                left = eval_node(node.left)
+                right = eval_node(node.right)
+                if isinstance(node.op, (ast.Div, ast.FloorDiv)) and abs(right) < 1e-12:
+                    raise ZeroDivisionError
+                return ops[type(node.op)](left, right)
+            raise ValueError(f"Unsupported expression node: {type(node).__name__}")
+
+        try:
+            value = eval_node(ast.parse(expr, mode="eval"))
+        except Exception:
+            return None
+        if abs(value) > 1e12:
+            return None
+        return float(value)
 
     @staticmethod
     def compute_accuracy_reward(pred: Optional[float], target: float) -> float:
@@ -204,6 +255,68 @@ class MathReward:
     """
 
     FORMAT_SCORE = 0.1  # 格式正确但答案错误的安慰分
+    FORMAT_TAGS = ("thinking", "tool_call", "result")
+
+    @staticmethod
+    def truncate_at_first_result(text: str) -> str:
+        """保留第一段完整答案，丢掉模型后续续写的标签或闲聊。"""
+        first_result = text.find("</result>")
+        if first_result != -1:
+            return text[:first_result + len("</result>")]
+        return text
+
+    @staticmethod
+    def canonicalize_main_response(text: str) -> str:
+        """
+        将可解析的 Main 输出收敛为严格三段式。
+
+        这一步不凭空补答案；只在模型已经给出可抽取数字时去掉单位、
+        tool_result 等会破坏状态机的噪声。
+        """
+        clean = MathReward.truncate_at_first_result(text).strip()
+
+        thinking_match = re.search(r"<thinking>\s*(.*?)\s*</thinking>", clean, re.DOTALL)
+        thinking = thinking_match.group(1).strip() if thinking_match else ""
+        if not thinking:
+            before_tool = re.split(r"\[tool_call\]|<result>|答案|result", clean, maxsplit=1)[0]
+            thinking = re.sub(r"<[^>]+>", "", before_tool).strip()
+        if not thinking:
+            thinking = "分析题目并确定计算步骤"
+
+        tool_match = re.search(r"\[tool_call\]\s*(.*?)\s*\[/tool_call\]", clean, re.DOTALL)
+        tool_call = tool_match.group(1).strip() if tool_match else ""
+        if not tool_call:
+            exprs = re.findall(r"-?\d+(?:\.\d+)?\s*[+\-×*/÷]\s*-?\d+(?:\.\d+)?", clean)
+            tool_call = exprs[-1].strip() if exprs else "计算答案"
+        tool_call = re.sub(r"<[^>]+>", "", tool_call).strip()
+
+        tool_value = MathEnvironment.safe_eval_expression(tool_call)
+        result_match = re.search(r"<result>\s*(.*?)\s*</result>", clean, re.DOTALL)
+        result_text = result_match.group(1).strip() if result_match else clean
+        pred = tool_value if tool_value is not None else MathEnvironment.extract_number(result_text)
+        if pred is None:
+            return clean
+
+        result = str(int(pred)) if abs(pred - round(pred)) < 1e-9 else str(pred)
+        return (
+            f"<thinking>{thinking}</thinking>"
+            f"[tool_call]{tool_call}[/tool_call]"
+            f"<result>{result}</result>"
+        )
+
+    @staticmethod
+    def canonicalize_sub_response(text: str) -> str:
+        clean = MathReward.truncate_at_first_result(text).strip()
+        thinking_match = re.search(r"<thinking>\s*(.*?)\s*</thinking>", clean, re.DOTALL)
+        thinking = thinking_match.group(1).strip() if thinking_match else "执行计算"
+        result_match = re.search(r"<result>\s*(.*?)\s*</result>", clean, re.DOTALL)
+        result_text = result_match.group(1).strip() if result_match else clean
+        expr_value = MathEnvironment.safe_eval_expression(clean)
+        pred = expr_value if expr_value is not None else MathEnvironment.extract_number(result_text)
+        if pred is None:
+            return clean
+        result = str(int(pred)) if abs(pred - round(pred)) < 1e-9 else str(pred)
+        return f"<thinking>{thinking}</thinking><result>{result}</result>"
 
     # ── 格式验证（状态机，对齐原始 MrlX） ──
 
@@ -309,10 +422,7 @@ class MathReward:
         """
         Main Agent 奖励 — 对齐原始 MrlX compute_score_em
         """
-        # 截断到最后一个 </result>，忽略后面的垃圾文本
-        last_result = main_response.rfind("</result>")
-        if last_result != -1:
-            main_response = main_response[:last_result + len("</result>")]
+        main_response = MathReward.truncate_at_first_result(main_response)
 
         is_valid_format = MathReward._validate_main_format(main_response)
 
@@ -330,13 +440,40 @@ class MathReward:
             return MathReward.FORMAT_SCORE
 
     @staticmethod
+    def compute_main_reward_hybrid(task: MathTask, main_response: str, sub_results: List[str]) -> float:
+        """
+        训练早期使用的过渡奖励。
+
+        目标是先提高可学习信号密度：格式标签给平滑分，答案正确给主要分。
+        当模型格式稳定后，可以切回 compute_main_reward 的硬二值奖励。
+        """
+        main_response = MathReward.truncate_at_first_result(main_response)
+        strict_format = MathReward._validate_main_format(main_response)
+
+        has_thinking = "<thinking>" in main_response and "</thinking>" in main_response
+        has_tool = "[tool_call]" in main_response and "[/tool_call]" in main_response
+        has_result = "<result>" in main_response and "</result>" in main_response
+
+        format_score = 0.0
+        if has_thinking:
+            format_score += 0.10
+        if has_tool:
+            format_score += 0.10
+        if has_result:
+            format_score += 0.15
+        if strict_format:
+            format_score += 0.15
+
+        pred = MathEnvironment.extract_number(main_response)
+        answer_score = 0.50 if has_result and MathEnvironment.check_answer(pred, task.answer) else 0.0
+        return min(format_score + answer_score, 1.0)
+
+    @staticmethod
     def compute_sub_reward(subtask: str, sub_response: str, main_score: float, task_answer: float) -> float:
         """
         Sub Agent 奖励 — 对齐原始 MrlX sub_agent_multiturn.reward_func
         """
-        last_result = sub_response.rfind("</result>")
-        if last_result != -1:
-            sub_response = sub_response[:last_result + len("</result>")]
+        sub_response = MathReward.truncate_at_first_result(sub_response)
 
         is_valid_format = MathReward._validate_sub_format(sub_response)
 

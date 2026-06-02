@@ -918,7 +918,7 @@ class CoTrainSystemOptimized:
                     test_main_rewards.extend(main_rewards)
                     test_sub_rewards.extend(sub_rewards)
                     
-                    predicted = MathReward.extract_number(main_dialogues[-1]["response"])
+                    predicted = MathEnvironment.extract_number(main_dialogues[-1]["response"])
                     if predicted is not None and abs(predicted - task.answer) < 1e-2:
                         test_correct += 1
                 

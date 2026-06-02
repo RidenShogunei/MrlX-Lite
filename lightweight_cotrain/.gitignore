@@ -15,3 +15,30 @@ sft_grpo_*/
 grpo_mrlx_*/
 cotrain_checkpoints_*/
 simple_grpo_checkpoints/
+
+# Model/checkpoint outputs from HotpotQA/MAS experiments
+hotpotqa_grpo_*/
+hotpotqa_mas_*check*/
+hotpotqa_mas_grpo_*/
+hotpotqa_mas_joint_*/
+hotpotqa_mas_stage2_*/
+hotpotqa_mas_sub*/
+hotpotqa_mas_enhanced_*/
+hotpotqa_sub_pref*/
+hotpotqa_sft_checkpoints*/
+
+# Evaluation output directories; summaries are captured in reports
+hotpotqa_*_eval_*/
+hotpotqa_eval_suite*/
+hotpotqa_main_oracle*/
+hotpotqa_direct_eval*/
+
+# Smoke/test generated data
+*_smoke/
+*_smoke.jsonl
+*_layout_check/
+*_metric_check/
+*_ablation_check/
+
+# External repos used for reference only
+_external/

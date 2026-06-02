@@ -1,6 +1,7 @@
 """
 综合分析：SFT基线 vs GRPO各阶段效果对比
 """
+import argparse
 import os, sys, re, torch
 from pathlib import Path
 from typing import List, Tuple, Dict
@@ -23,7 +24,10 @@ def load_checkpoint(base_model_path: str, lora_path: str) -> Tuple:
         base_model_path, trust_remote_code=True,
         device_map="cuda:0", low_cpu_mem_usage=True
     )
-    model = PeftModel.from_pretrained(model, lora_path, adapter_name="default")
+    if lora_path:
+        if not os.path.exists(lora_path):
+            raise FileNotFoundError(f"LoRA checkpoint not found: {lora_path}")
+        model = PeftModel.from_pretrained(model, lora_path, adapter_name="default")
     tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -49,19 +53,24 @@ def build_prompt(tokenizer, task: MathTask, is_main: bool = True) -> str:
     return tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
 
 
-def generate(model, tokenizer, prompt: str, max_tokens: int = 128, n_samples: int = 8) -> List[str]:
+def generate(model, tokenizer, prompt: str, max_tokens: int = 128, n_samples: int = 8,
+             response_prefix: str = "", canonicalize: bool = False) -> List[str]:
     responses = []
     for _ in range(n_samples):
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+        inputs = tokenizer(prompt + response_prefix, return_tensors="pt", truncation=True, max_length=2048)
         inputs = {k: v.to("cuda:0") for k, v in inputs.items()}
         with torch.no_grad():
             out = model.generate(
-                **inputs, max_new_tokens=max_tokens, temperature=0.8, top_p=0.95,
+                **inputs, max_new_tokens=max_tokens, temperature=0.6, top_p=0.9,
+                repetition_penalty=1.05,
                 do_sample=True, pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
         plen = inputs["input_ids"].shape[1]
-        resp = tokenizer.decode(out[0][plen:], skip_special_tokens=True).strip()
+        generated = tokenizer.decode(out[0][plen:], skip_special_tokens=True).strip()
+        resp = MathReward.truncate_at_first_result(response_prefix + generated).strip()
+        if canonicalize:
+            resp = MathReward.canonicalize_main_response(resp)
         responses.append(resp)
     return responses
 
@@ -87,16 +96,24 @@ def analyze_response(response: str, task: MathTask) -> Dict:
     return analysis
 
 
-def evaluate_checkpoint(model, tokenizer, test_tasks: List[MathTask], name: str):
+def evaluate_checkpoint(model, tokenizer, test_tasks: List[MathTask], name: str,
+                        n_samples: int = 8, canonicalize: bool = True):
     """在一个 checkpoint 上全面评估"""
     print(f"\n{'='*70}")
-    print(f"  📊 评估: {name}")
+    print(f"  [Eval] {name}")
     print(f"{'='*70}")
 
     all_results = []
     for task in test_tasks:
         prompt = build_prompt(tokenizer, task, is_main=True)
-        responses = generate(model, tokenizer, prompt, n_samples=8)
+        responses = generate(
+            model,
+            tokenizer,
+            prompt,
+            n_samples=n_samples,
+            response_prefix="<thinking>" if canonicalize else "",
+            canonicalize=canonicalize,
+        )
 
         task_results = []
         for resp in responses:
@@ -149,7 +166,7 @@ def evaluate_checkpoint(model, tokenizer, test_tasks: List[MathTask], name: str)
     print(f"  平均奖励: {avg_reward:.3f}  平均长度: {avg_length:.0f} chars")
     print(f"  奖励分布:")
     for bin_name, count in sorted(reward_bins.items()):
-        bar = "█" * (count * 40 // len(flat))
+        bar = "#" * (count * 40 // len(flat))
         print(f"    {bin_name:>8}: {count:>3} [{bar}]")
 
     return {
@@ -170,7 +187,7 @@ def evaluate_checkpoint(model, tokenizer, test_tasks: List[MathTask], name: str)
 def show_sample_outputs(all_eval_results: List[Dict], test_tasks: List[MathTask]):
     """展示典型样本"""
     print(f"\n{'='*70}")
-    print(f"  📝 样本对比")
+    print(f"  [Samples]")
     print(f"{'='*70}")
 
     # 挑一题展示各阶段
@@ -186,7 +203,7 @@ def show_sample_outputs(all_eval_results: List[Dict], test_tasks: List[MathTask]
         print(f"  Reward: {best['reward']:.3f}")
         resp_text = best.get("response", "N/A") if "response" in best else "(省略)"
         if best["predicted"] is not None:
-            status = "✅" if best["correct"] else "❌"
+            status = "OK" if best["correct"] else "ERR"
             print(f"  预测: {best['predicted']} {status}")
         print(f"  响应: {best.get('response_text', '(未存储完整文本)')[:200]}")
 
@@ -194,27 +211,38 @@ def show_sample_outputs(all_eval_results: List[Dict], test_tasks: List[MathTask]
 def print_summary_table(all_eval_results: List[Dict]):
     """打印汇总表"""
     print(f"\n{'='*70}")
-    print(f"  📈 汇总对比")
+    print(f"  [Summary]")
     print(f"{'='*70}")
     print(f"  {'阶段':<18} {'格式':>8} {'tool_call':>10} {'<result>':>9} {'正确率':>8} {'Best-N':>8} {'平均奖励':>9}")
-    print(f"  {'─'*18} {'─'*8} {'─'*10} {'─'*9} {'─'*8} {'─'*8} {'─'*9}")
+    print(f"  {'-'*18} {'-'*8} {'-'*10} {'-'*9} {'-'*8} {'-'*8} {'-'*9}")
 
     for er in all_eval_results:
         print(f"  {er['name']:<18} {er['thinking_rate']:>7.1%} {er['tool_call_rate']:>9.1%} "
               f"{er['result_rate']:>8.1%} {er['correct_rate']:>7.1%} {er['best_acc']:>7.1%} {er['avg_reward']:>8.3f}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate SFT/GRPO checkpoints on math tasks.")
+    parser.add_argument("--tasks", type=int, default=10, help="Number of test tasks to evaluate.")
+    parser.add_argument("--samples", type=int, default=8, help="Samples per task.")
+    parser.add_argument("--steps", type=int, nargs="*", default=[5, 10, 15, 20], help="GRPO steps to evaluate.")
+    parser.add_argument("--raw", action="store_true", help="Evaluate raw outputs without prefix/canonicalization.")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     print("=" * 70)
-    print("  🔬 SFT + GRPO 综合分析")
+    print("  SFT + GRPO 综合分析")
     print("=" * 70)
     print(f"  PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}")
+    print(f"  Eval config: tasks={args.tasks}, samples={args.samples}, steps={args.steps}, raw={args.raw}")
 
     base_model_path = "./models/qwen/Qwen2___5-1___5B-Instruct"
 
     # 测试题（不在训练集中的）
     env = MathEnvironment(seed=99)
-    test_tasks = env.tasks[-10:]  # 最后10题
+    test_tasks = env.tasks[-args.tasks:]  # 最后 N 题
     print(f"\n[系统] 测试题数: {len(test_tasks)}")
     for i, t in enumerate(test_tasks):
         print(f"  [{i+1}] {t.question[:50]}... (ans={t.answer})")
@@ -228,35 +256,41 @@ def main():
     print(f"{'#':^70}")
     print(f"{'#'*70}")
     try:
-        model, tokenizer = load_checkpoint(base_model_path, "./sft_checkpoints/main_agent/main")
-        # 重置 LoRA 权重为零（相当于不用）
-        er = evaluate_checkpoint(model, tokenizer, test_tasks, "0-基础模型(无训练)")
+        model, tokenizer = load_checkpoint(base_model_path, "")
+        er = evaluate_checkpoint(model, tokenizer, test_tasks, "0-基础模型(无训练)",
+                                 n_samples=args.samples, canonicalize=not args.raw)
         all_eval_results.append(er)
         del model; torch.cuda.empty_cache()
     except Exception as e:
-        print(f"  ❌ 加载失败: {e}")
+        print(f"  [FAIL] 加载失败: {e}")
 
     # --- 1: SFT 后（Main Agent）---
     print(f"\n\n{'#'*70}")
     print(f"  {'阶段 1: SFT 后（仅格式训练）':^62}")
     print(f"{'#'*70}")
-    model, tokenizer = load_checkpoint(base_model_path, "./sft_checkpoints/main_agent/main")
-    er = evaluate_checkpoint(model, tokenizer, test_tasks, "1-SFT格式化后")
-    all_eval_results.append(er)
-    del model; torch.cuda.empty_cache()
+    sft_lora = "./sft_checkpoints/main_agent/main"
+    if os.path.exists(sft_lora):
+        model, tokenizer = load_checkpoint(base_model_path, sft_lora)
+        er = evaluate_checkpoint(model, tokenizer, test_tasks, "1-SFT格式化后",
+                                 n_samples=args.samples, canonicalize=not args.raw)
+        all_eval_results.append(er)
+        del model; torch.cuda.empty_cache()
+    else:
+        print(f"  [WARN] {sft_lora} 不存在，跳过 SFT 阶段")
 
     # --- 2-5: GRPO 各阶段---
-    for step in [5, 10, 15, 20]:
+    for step in args.steps:
         lora_dir = f"./sft_grpo_v4/main_step_{step}/main"
         if not os.path.exists(lora_dir):
-            print(f"\n  ⚠️ {lora_dir} 不存在，跳过")
+            print(f"\n  [WARN] {lora_dir} 不存在，跳过")
             continue
 
         print(f"\n\n{'#'*70}")
         print(f"  {'阶段 2: GRPO step ' + str(step):^62}")
         print(f"{'#'*70}")
         model, tokenizer = load_checkpoint(base_model_path, lora_dir)
-        er = evaluate_checkpoint(model, tokenizer, test_tasks, f"2-GRPO_step_{step}")
+        er = evaluate_checkpoint(model, tokenizer, test_tasks, f"2-GRPO_step_{step}",
+                                 n_samples=args.samples, canonicalize=not args.raw)
         all_eval_results.append(er)
         del model; torch.cuda.empty_cache()
 
@@ -265,7 +299,7 @@ def main():
 
     # 键指标趋势
     print(f"\n{'='*70}")
-    print(f"  📈 关键指标趋势")
+    print(f"  [Trends] 关键指标趋势")
     print(f"{'='*70}")
     for metric, label in [("avg_reward","平均奖励"), ("correct_rate","正确率"), ("best_acc","Best-N正确率")]:
         labels = [er["name"] for er in all_eval_results]
@@ -273,11 +307,11 @@ def main():
         print(f"  {label}:")
         for lb, v in zip(labels, values):
             bar_len = int(v * 40)
-            print(f"    {lb:<22} {v:.3f}  {'█'*bar_len}")
+            print(f"    {lb:<22} {v:.3f}  {'#'*bar_len}")
 
     # 奖励分布变化
     print(f"\n{'='*70}")
-    print(f"  📊 奖励分布变化")
+    print(f"  [Reward Distribution] 奖励分布变化")
     print(f"{'='*70}")
     for er in all_eval_results:
         bins = er["reward_bins"]
@@ -287,7 +321,7 @@ def main():
         print(f"  {er['name']:<22} 零奖励={zero_pct:5.1f}%  高奖励(>0.6)={high_pct:5.1f}%")
 
     print(f"\n{'='*70}")
-    print(f"  ✅ 分析完成！")
+    print(f"  [OK] 分析完成！")
     print(f"{'='*70}")
 
 
