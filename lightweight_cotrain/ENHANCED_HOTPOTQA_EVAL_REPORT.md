@@ -670,3 +670,75 @@ Sub summary / Main-Sub output distribution 被 joint 更新扰动。
 4. Main/Sub 分别使用不同 update threshold。
 5. 或实现真正 GRPO advantage，而不是只做 best sample 加权 SFT。
 ```
+
+## Dynamic MAS Prototype
+
+为了支持动态分派，新增第一版动态 MAS 组件：
+
+```text
+generate_hotpotqa_dynamic_mas_sft_data.py
+analyze_hotpotqa_dynamic_mas_results.py
+```
+
+目标结构：
+
+```text
+Main plan:
+  [mode]direct[/mode]
+or:
+  [mode]delegate[/mode]
+  [subtask]...[/subtask]
+  [subtask]...[/subtask]
+
+Sub:
+  每个 subtask 独立运行 search/read/summary
+  多个 Sub instance 共享同一个 Sub LoRA
+
+Main answer:
+  汇总多个 Sub results
+```
+
+当前实现特性：
+
+```text
+1. 支持 direct/delegate 解析。
+2. 支持最多 max_subagents 个 subtask。
+3. 多个 Sub instance 共享 Sub adapter，但 history 独立。
+4. 评估指标新增 direct_rate 和 avg_subtasks。
+5. 如果 Main 没有生成 subtask，会 fallback 到 1 个默认 research subtask。
+```
+
+Smoke：
+
+```bash
+python generate_hotpotqa_dynamic_mas_sft_data.py ^
+  --train-jsonl .\hotpotqa_data_enhanced\train.jsonl ^
+  --output .\hotpotqa_dynamic_mas_sft_data_smoke.jsonl ^
+  --limit 5 ^
+  --max-subtasks 2
+
+python analyze_hotpotqa_dynamic_mas_results.py ^
+  --val-jsonl .\hotpotqa_data_enhanced\val.jsonl ^
+  --tasks 2 ^
+  --samples 1 ^
+  --main-lora .\hotpotqa_mas_enhanced_mainonly_conservative_50x1\best\main ^
+  --sub-lora .\hotpotqa_mas_enhanced_mainonly_conservative_50x1\best\sub ^
+  --max-subagents 2
+```
+
+Smoke 结果：
+
+```text
+direct_rate = 0.000
+avg_subtasks = 1.000
+tool_valid = 1.000
+```
+
+因为现有 Main 没有接受过 dynamic plan SFT，所以 fallback 到 1 个默认 subtask 是预期行为。下一步需要：
+
+```text
+1. 生成正式 dynamic MAS SFT 数据。
+2. 训练 dynamic Main adapter。
+3. 再评估 direct_rate / avg_subtasks 是否真的动态化。
+4. 最后接 dynamic GRPO。
+```
