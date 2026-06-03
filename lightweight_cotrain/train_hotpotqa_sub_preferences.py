@@ -177,7 +177,7 @@ def train(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train HotpotQA Sub action preferences.")
-    parser.add_argument("--base-model", default="./models/qwen/Qwen2___5-1___5B-Instruct")
+    parser.add_argument("--base-model", default="/home/jinxu/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B")
     parser.add_argument("--sub-lora", default="./hotpotqa_mas_sft_checkpoints_v2/sub_agent/sub")
     parser.add_argument("--train-jsonl", default="./hotpotqa_data/train.jsonl")
     parser.add_argument("--save-dir", default="./hotpotqa_sub_pref_checkpoints/sub")

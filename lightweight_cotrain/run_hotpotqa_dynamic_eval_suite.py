@@ -90,7 +90,7 @@ def write_markdown(path: Path, rows):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run dynamic HotpotQA MAS multi-offset evaluation.")
-    parser.add_argument("--base-model", default="./models/qwen/Qwen2___5-1___5B-Instruct")
+    parser.add_argument("--base-model", default="/home/jinxu/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B")
     parser.add_argument("--val-jsonl", default="./hotpotqa_data_enhanced/val.jsonl")
     parser.add_argument("--out-dir", default="./hotpotqa_dynamic_eval_suite")
     parser.add_argument("--model-names", nargs="*", default=[])

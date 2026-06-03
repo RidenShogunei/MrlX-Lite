@@ -151,7 +151,7 @@ def write_summary(path: Path, rows):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate Main with oracle Sub result.")
-    parser.add_argument("--base-model", default="./models/qwen/Qwen2___5-1___5B-Instruct")
+    parser.add_argument("--base-model", default="/home/jinxu/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B")
     parser.add_argument("--val-jsonl", default="./hotpotqa_data/val.jsonl")
     parser.add_argument("--out-dir", default="./hotpotqa_main_oracle_eval")
     parser.add_argument("--offsets", type=int, nargs="+", default=[0, 20, 40])

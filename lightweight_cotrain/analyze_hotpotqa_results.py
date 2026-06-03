@@ -134,7 +134,7 @@ def evaluate(model, tokenizer, tasks, device: str, samples: int, max_tokens: int
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate HotpotQA adapters.")
-    parser.add_argument("--base-model", default="./models/qwen/Qwen2___5-1___5B-Instruct")
+    parser.add_argument("--base-model", default="/home/jinxu/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B")
     parser.add_argument("--lora", default="")
     parser.add_argument("--val-jsonl", default="./hotpotqa_data_smoke/val.jsonl")
     parser.add_argument("--tasks", type=int, default=20)

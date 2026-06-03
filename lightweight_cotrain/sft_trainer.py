@@ -15,7 +15,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 @dataclass
 class CoTrainConfig:
-    base_model: str = "./models/qwen/Qwen2___5-1___5B-Instruct"
+    base_model: str = "/home/jinxu/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B"
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
@@ -206,7 +206,7 @@ def main():
     parser.add_argument("--save-dir", default="./sft_checkpoints")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--base-model", default="./models/qwen/Qwen2___5-1___5B-Instruct")
+    parser.add_argument("--base-model", default="/home/jinxu/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B")
     parser.add_argument("--max-length", type=int, default=1024)
     parser.add_argument("--main-lora", default=None, help="Optional Main LoRA path to continue training from.")
     parser.add_argument("--sub-lora", default=None, help="Optional Sub LoRA path to continue training from.")

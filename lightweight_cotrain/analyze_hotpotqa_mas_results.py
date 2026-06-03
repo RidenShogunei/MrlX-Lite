@@ -160,7 +160,7 @@ def evaluate(model, tokenizer, tasks, device: str, samples: int, max_tokens: int
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate HotpotQA MAS checkpoints.")
-    parser.add_argument("--base-model", default="./models/qwen/Qwen2___5-1___5B-Instruct")
+    parser.add_argument("--base-model", default="/home/jinxu/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B")
     parser.add_argument("--main-lora", default="./hotpotqa_mas_sft_checkpoints/main_agent/main")
     parser.add_argument("--sub-lora", default="./hotpotqa_mas_sft_checkpoints/sub_agent/sub")
     parser.add_argument("--val-jsonl", default="./hotpotqa_data/val.jsonl")

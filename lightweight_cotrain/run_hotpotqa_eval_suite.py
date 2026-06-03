@@ -204,7 +204,7 @@ def write_markdown(path: Path, mas_rows, sub_rows):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run HotpotQA multi-slice evaluation suite.")
-    parser.add_argument("--base-model", default="./models/qwen/Qwen2___5-1___5B-Instruct")
+    parser.add_argument("--base-model", default="/home/jinxu/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B")
     parser.add_argument("--val-jsonl", default="./hotpotqa_data/val.jsonl")
     parser.add_argument("--out-dir", default="./hotpotqa_eval_suite")
     parser.add_argument("--suite", choices=["all", "mas", "sub"], default="all")
