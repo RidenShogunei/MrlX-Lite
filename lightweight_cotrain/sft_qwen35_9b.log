@@ -1,0 +1,29 @@
+Skipping import of cpp extensions due to incompatible torch version. Please upgrade to torch >= 2.11.0 (found 2.10.0+cu128).
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+PyTorch: 2.10.0+cu128
+CUDA available: True
+CUDA device: NVIDIA A100-PCIE-40GB
+VRAM: 42.4 GB
+
+[system] Loading tokenizer...
+[system] Loading base model...
+Loading weights:   0%|          | 0/427 [00:00<?, ?it/s]Loading weights:   0%|          | 1/427 [00:00<01:47,  3.96it/s]Loading weights:   0%|          | 2/427 [00:00<02:00,  3.53it/s]Loading weights:   5%|▌         | 23/427 [00:00<00:08, 49.03it/s]Loading weights:   9%|▊         | 37/427 [00:00<00:05, 67.02it/s]Loading weights:  11%|█         | 47/427 [00:00<00:05, 65.09it/s]Loading weights:  15%|█▌        | 65/427 [00:01<00:03, 91.41it/s]Loading weights:  18%|█▊        | 77/427 [00:01<00:03, 94.89it/s]Loading weights:  21%|██        | 89/427 [00:01<00:03, 95.34it/s]Loading weights:  23%|██▎       | 100/427 [00:01<00:03, 88.08it/s]Loading weights:  28%|██▊       | 119/427 [00:01<00:02, 106.00it/s]Loading weights:  31%|███       | 133/427 [00:01<00:02, 107.75it/s]Loading weights:  34%|███▍      | 147/427 [00:01<00:02, 109.14it/s]Loading weights:  37%|███▋      | 159/427 [00:01<00:02, 98.63it/s] Loading weights:  40%|████      | 172/427 [00:02<00:02, 105.65it/s]Loading weights:  44%|████▎     | 186/427 [00:02<00:02, 107.85it/s]Loading weights:  46%|████▋     | 198/427 [00:02<00:02, 104.31it/s]Loading weights:  49%|████▉     | 209/427 [00:02<00:02, 95.64it/s] Loading weights:  53%|█████▎    | 225/427 [00:02<00:01, 111.54it/s]Loading weights:  56%|█████▌    | 239/427 [00:02<00:01, 111.52it/s]Loading weights:  59%|█████▉    | 252/427 [00:02<00:01, 102.29it/s]Loading weights:  62%|██████▏   | 263/427 [00:02<00:01, 100.34it/s]Loading weights:  65%|██████▌   | 278/427 [00:03<00:01, 110.11it/s]Loading weights:  68%|██████▊   | 291/427 [00:03<00:01, 108.33it/s]Loading weights:  72%|███████▏  | 306/427 [00:03<00:01, 112.01it/s]Loading weights:  74%|███████▍  | 318/427 [00:03<00:01, 99.85it/s] Loading weights:  78%|███████▊  | 332/427 [00:03<00:00, 105.45it/s]Loading weights:  81%|████████  | 346/427 [00:03<00:00, 107.61it/s]Loading weights:  84%|████████▍ | 360/427 [00:03<00:00, 109.00it/s]Loading weights:  87%|████████▋ | 372/427 [00:03<00:00, 100.58it/s]Loading weights:  90%|█████████ | 386/427 [00:04<00:00, 103.46it/s]Loading weights:  94%|█████████▎| 400/427 [00:04<00:00, 106.19it/s]Loading weights:  97%|█████████▋| 414/427 [00:04<00:00, 107.63it/s]Loading weights: 100%|█████████▉| 425/427 [00:04<00:00, 103.61it/s]Loading weights: 100%|██████████| 427/427 [00:04<00:00, 95.17it/s] 
+[system] Loaded SFT data:
+  Main Agent: 500 samples
+  Sub Agent: 0 samples
+[system] Preparing training tensors...
+
+[system] Adding/loading Main Agent LoRA adapter...
+trainable params: 3,932,160 || all params: 8,957,735,424 || trainable%: 0.0439
+
+============================================================
+Training Main Agent LoRA...
+============================================================
+Samples: 500
+Epochs: 1
+LR: 3e-05
+Epoch 1/1 - Loss: 0.3684
+LoRA weights saved to: ./hotpotqa_qwen35_9b_sft_500x1/main_agent
+
+[system] SFT training complete.
+[system] Weights saved to: ./hotpotqa_qwen35_9b_sft_500x1
