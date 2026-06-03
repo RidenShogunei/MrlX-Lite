@@ -1,0 +1,15 @@
+Skipping import of cpp extensions due to incompatible torch version. Please upgrade to torch >= 2.11.0 (found 2.10.0+cu128).
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+Loading weights:   0%|          | 0/427 [00:00<?, ?it/s]Loading weights:   0%|          | 1/427 [00:00<03:55,  1.81it/s]Loading weights:   5%|▌         | 23/427 [00:00<00:08, 45.79it/s]Loading weights:   8%|▊         | 36/427 [00:00<00:06, 60.50it/s]Loading weights:  11%|█         | 48/427 [00:00<00:06, 60.97it/s]Loading weights:  15%|█▌        | 65/427 [00:01<00:04, 83.66it/s]Loading weights:  19%|█▊        | 79/427 [00:01<00:03, 91.69it/s]Loading weights:  22%|██▏       | 93/427 [00:01<00:03, 99.39it/s]Loading weights:  25%|██▍       | 105/427 [00:01<00:03, 94.28it/s]Loading weights:  28%|██▊       | 120/427 [00:01<00:02, 105.76it/s]Loading weights:  31%|███       | 133/427 [00:01<00:02, 102.90it/s]Loading weights:  35%|███▍      | 149/427 [00:01<00:02, 114.60it/s]Loading weights:  38%|███▊      | 162/427 [00:01<00:02, 116.30it/s]Loading weights:  41%|████      | 175/427 [00:02<00:02, 113.38it/s]Loading weights:  44%|████▍     | 188/427 [00:02<00:02, 112.63it/s]Loading weights:  47%|████▋     | 200/427 [00:02<00:02, 110.30it/s]Loading weights:  50%|████▉     | 213/427 [00:02<00:01, 113.93it/s]Loading weights:  53%|█████▎    | 227/427 [00:02<00:01, 115.44it/s]Loading weights:  56%|█████▌    | 240/427 [00:02<00:01, 113.44it/s]Loading weights:  60%|█████▉    | 255/427 [00:02<00:01, 118.35it/s]Loading weights:  63%|██████▎   | 267/427 [00:02<00:01, 115.20it/s]Loading weights:  66%|██████▌   | 280/427 [00:02<00:01, 115.13it/s]Loading weights:  69%|██████▉   | 294/427 [00:03<00:01, 117.56it/s]Loading weights:  72%|███████▏  | 308/427 [00:03<00:01, 118.77it/s]Loading weights:  75%|███████▍  | 320/427 [00:03<00:00, 116.32it/s]Loading weights:  78%|███████▊  | 333/427 [00:03<00:00, 116.14it/s]Loading weights:  81%|████████▏ | 347/427 [00:03<00:00, 119.58it/s]Loading weights:  85%|████████▍ | 361/427 [00:03<00:00, 119.25it/s]Loading weights:  87%|████████▋ | 373/427 [00:03<00:00, 117.59it/s]Loading weights:  90%|█████████ | 386/427 [00:03<00:00, 116.27it/s]Loading weights:  94%|█████████▎| 400/427 [00:03<00:00, 116.83it/s]Loading weights:  97%|█████████▋| 414/427 [00:04<00:00, 117.44it/s]Loading weights: 100%|█████████▉| 426/427 [00:04<00:00, 115.59it/s]Loading weights: 100%|██████████| 427/427 [00:04<00:00, 101.40it/s]
+[hotpotqa-dynamic-mas-eval]
+main_lora=./hotpotqa_qwen35_9b_sft_500x1/main_agent
+sub_lora=./hotpotqa_qwen35_9b_sub_500x1/sub_agent
+tasks=10 offset=0 seed=123 samples=2
+direct_rate=0.150
+avg_subtasks=1.000
+tool_valid=0.850
+answer_f1=0.458
+evidence=0.725
+reward=0.551
+best_reward=0.657
+best_answer_f1=0.567
