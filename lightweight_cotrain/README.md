@@ -1,6 +1,6 @@
 # HotpotQA Dynamic MAS Experiments
 
-This workspace is now focused on reproducing and extending M-GRPO-style
+This workspace is focused on reproducing and extending M-GRPO-style
 multi-agent training on a local HotpotQA environment.
 
 The current research line is:
@@ -13,9 +13,6 @@ HotpotQA local search/read environment
 -> Main-only dynamic GRPO
 -> joint GRPO, only after the staged system is stable
 ```
-
-Older math/tool/research experiments from the original lightweight cotrain repo
-are kept under `legacy/` for reference only.
 
 ## Current Checkpoints
 
