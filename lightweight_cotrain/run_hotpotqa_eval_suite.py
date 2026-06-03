@@ -13,18 +13,13 @@ from hotpotqa_environment import HotpotQAEnvironment
 
 MAS_MODELS = [
     {
-        "name": "stage2_main_50x2",
-        "main_lora": "./hotpotqa_mas_stage2_main_prefsub_50x2/best/main",
-        "sub_lora": "./hotpotqa_mas_stage2_main_prefsub_50x2/best/sub",
-    },
-    {
-        "name": "joint_30x1",
-        "main_lora": "./hotpotqa_mas_joint_from_stage2_30x1/best/main",
-        "sub_lora": "./hotpotqa_mas_joint_from_stage2_30x1/best/sub",
+        "name": "fixed_staged_best",
+        "main_lora": "./hotpotqa_mas_enhanced_mainonly_conservative_50x1/best/main",
+        "sub_lora": "./hotpotqa_mas_enhanced_mainonly_conservative_50x1/best/sub",
     },
     {
         "name": "stage2_main_enhanced_sub",
-        "main_lora": "./hotpotqa_mas_stage2_main_prefsub_50x2/best/main",
+        "main_lora": "./hotpotqa_mas_enhanced_mainonly_conservative_50x1/best/main",
         "sub_lora": "./hotpotqa_sub_pref_enhanced_300x900/sub",
     },
 ]

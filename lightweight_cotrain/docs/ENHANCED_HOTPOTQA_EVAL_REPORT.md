@@ -946,3 +946,50 @@ Run a larger validation sweep for synthesis 500x1 before GRPO.
 If it holds across offsets, use it as the starting Main for Main-only dynamic GRPO.
 Keep Sub frozen for the next RL step.
 ```
+
+## Dynamic Multi-Offset Validation
+
+Ran a 5-slice validation sweep:
+```text
+offsets = 0, 20, 40, 60, 80
+tasks per offset = 10
+samples = 2
+val split = hotpotqa_data_enhanced/val.jsonl
+```
+
+Dynamic MAS averages:
+| Model | direct_rate | avg_subtasks | answer_f1 | evidence | reward | best_answer_f1 | best_reward | tool_valid |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| dynamic_mixture_v3 | 0.000 | 1.840 | 0.318 | 0.675 | 0.458 | 0.392 | 0.516 | 1.000 |
+| dynamic_synthesis_500x1 | 0.000 | 1.830 | 0.344 | 0.655 | 0.472 | 0.394 | 0.516 | 1.000 |
+
+Current fixed MAS baseline on the same slices:
+| Model | answer_f1 | evidence | reward | best_answer_f1 | best_reward | tool_valid |
+|---|---:|---:|---:|---:|---:|---:|
+| fixed_staged_best | 0.413 | 0.495 | 0.488 | 0.524 | 0.575 | 1.000 |
+
+Per-slice observation:
+```text
+Synthesis 500x1 improves the dynamic average:
+  reward    0.458 -> 0.472
+  answer_f1 0.318 -> 0.344
+
+But it is not uniformly better across offsets.
+The largest regression is offset 40:
+  dynamic_mixture_v3 reward       = 0.414
+  dynamic_synthesis_500x1 reward  = 0.331
+
+Compared with fixed MAS, dynamic still has:
+  higher evidence recall: 0.655 vs 0.495
+  lower answer_f1:        0.344 vs 0.413
+  lower reward:           0.472 vs 0.488
+```
+
+Decision:
+```text
+Synthesis 500x1 is a real improvement over dynamic_mixture_v3, but not stable enough
+to treat as a solved starting point for joint GRPO.
+
+The next RL step should still be Main-only if we proceed, with Sub frozen.
+Before that, inspect offset 40 failures and improve synthesis robustness.
+```
