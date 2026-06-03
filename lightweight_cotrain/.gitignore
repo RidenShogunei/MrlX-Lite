@@ -29,6 +29,7 @@ hotpotqa_sft_checkpoints*/
 hotpotqa_dynamic_mas_*sft_*/
 hotpotqa_dynamic_mas_*continued_*/
 hotpotqa_dynamic_mixture_*sft_*/
+hotpotqa_dynamic_synthesis_*mainonly_*/
 
 # Evaluation output directories; summaries are captured in reports
 hotpotqa_*_eval_*/

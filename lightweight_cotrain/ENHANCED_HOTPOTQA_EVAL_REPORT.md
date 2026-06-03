@@ -889,3 +889,60 @@ Then evaluate:
   2. dynamic answer_f1 rises
   3. fixed MAS degradation remains bounded
 ```
+
+## Dynamic Synthesis Main-Only SFT
+
+Implemented:
+```text
+generate_hotpotqa_dynamic_synthesis_sft_data.py
+hotpotqa_dynamic_synthesis_sft_data_500.jsonl
+```
+
+Purpose:
+```text
+Freeze Sub and train only Main's final answer synthesis step.
+Input contains multiple focused Sub results with evidence snippets.
+Target is one clean final:
+  <result>answer | evidence: Dxx, Dyy</result>
+```
+
+Training:
+```text
+start main = hotpotqa_dynamic_mixture_sft_300x1_v3/main_agent
+sub frozen = hotpotqa_dynamic_mixture_sft_300x1_v3/sub_agent
+samples    = 500 Main-only synthesis samples
+epochs     = 1
+lr         = 3e-5
+max_length = 1536
+loss       = 0.2391
+```
+
+20-task hard validation, offset 0, samples 2:
+| Model / Protocol | direct_rate | avg_subtasks | answer_f1 | evidence | reward | best_answer_f1 | best_reward |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Dynamic mixture v3 / dynamic MAS | 0.000 | 1.800 | 0.224 | 0.675 | 0.392 | 0.248 | 0.418 |
+| Synthesis 300x1 / dynamic MAS | 0.000 | 1.850 | 0.254 | 0.662 | 0.410 | 0.346 | 0.488 |
+| Synthesis 500x1 / dynamic MAS | 0.000 | 1.825 | 0.316 | 0.700 | 0.461 | 0.418 | 0.542 |
+| Synthesis 500x1 / fixed MAS | - | - | 0.388 | 0.450 | 0.462 | 0.400 | 0.475 |
+
+Interpretation:
+```text
+Main-only synthesis SFT works.
+It improves dynamic answer_f1 from 0.224 to 0.316 and dynamic reward from 0.392 to 0.461,
+while keeping high evidence recall around 0.700.
+
+The result is still below staged best fixed MAS on the same 20-task slice:
+  staged best fixed reward = 0.527
+  synthesis 500 dynamic reward = 0.461
+
+But the dynamic line now has a concrete improvement path:
+  planner/evidence is mostly working;
+  final synthesis is improving with targeted Main-only SFT.
+```
+
+Next step:
+```text
+Run a larger validation sweep for synthesis 500x1 before GRPO.
+If it holds across offsets, use it as the starting Main for Main-only dynamic GRPO.
+Keep Sub frozen for the next RL step.
+```
