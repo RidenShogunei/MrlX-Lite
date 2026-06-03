@@ -4,17 +4,19 @@ This uses the official TRL implementation which handles:
 - Efficient log prob computation
 - DeepSpeed ZeRO-3 integration
 - Batched generation and reward computation
+
+Usage:
+    python grpo_hotpotqa_trl.py --base-model <path> --main-lora <path> \
+        --train-jsonl <path> --val-jsonl <path> --save-dir <path>
 """
 
 import argparse
 import re
 import string
-from pathlib import Path
 from typing import List
 
 import torch
 from datasets import Dataset
-from peft import LoraConfig, TaskType
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
@@ -61,43 +63,48 @@ def extract_evidence(text: str) -> List[str]:
     return [x.strip() for x in m.group(1).split(',') if x.strip()]
 
 
-def hotpotqa_reward_func(prompts: List[str], completions: List[str], **kwargs) -> List[float]:
+def hotpotqa_reward_func(
+    prompts: List[str],
+    completions: List[str],
+    gold_answer: List[str] = None,
+    gold_doc_ids: List[List[str]] = None,
+    **kwargs,
+) -> List[float]:
     """Reward function for TRL GRPOTrainer.
-    
-    TRL calls this with batches of prompts and completions.
-    We need to extract the answer and compare with ground truth.
+
+    TRL passes all dataset columns (except prompt/completion/completion_ids)
+    as kwargs. We use gold_answer and gold_doc_ids to compute rewards.
     """
     rewards = []
-    for prompt, completion in zip(prompts, completions):
-        # Extract ground truth from prompt
-        # Prompt format: "...Question: XXX\n\nDocuments:...\n\nAnswer:"
-        q_match = re.search(r'Question:\s*(.+?)\n\nDocuments:', prompt, re.DOTALL)
-        question = q_match.group(1).strip() if q_match else ""
-        
-        # Find the answer in the environment data
-        # For simplicity, we parse the gold answer from the prompt's system message
-        # In practice, you'd pass the gold answer through the dataset
-        
+    for i, (prompt, completion) in enumerate(zip(prompts, completions)):
         pred_answer = extract_answer(completion)
         pred_evidence = extract_evidence(completion)
-        
+
+        # Answer F1
+        answer_f1 = f1_score(pred_answer, gold_answer[i]) if gold_answer else 0.0
+
+        # Evidence recall
+        pred_doc_ids = set(pred_evidence)
+        gold_doc_ids_set = set(gold_doc_ids[i]) if gold_doc_ids else set()
+        evidence_recall = (
+            len(gold_doc_ids_set & pred_doc_ids) / len(gold_doc_ids_set)
+            if gold_doc_ids_set
+            else 0.0
+        )
+
         # Format reward
         has_result = '<result>' in completion and '</result>' in completion
         has_evidence = 'evidence:' in completion.lower()
         format_reward = 0.3 * has_result + 0.2 * has_evidence
-        
-        # We can't compute F1 without gold answer here
-        # TRL's reward_func signature doesn't pass extra metadata
-        # So we return format reward only, or use a wrapper dataset
-        
-        reward = format_reward
+
+        reward = 0.5 * answer_f1 + 0.3 * evidence_recall + format_reward
         rewards.append(reward)
-    
+
     return rewards
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = (
@@ -121,6 +128,10 @@ def build_prompt(task) -> str:
         f"Answer:"
     )
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
@@ -157,7 +168,7 @@ def main():
             "gold_answer": task.answer,
             "gold_doc_ids": task.support_doc_ids,
         })
-    
+
     val_data = []
     for task in val_env.tasks:
         val_data.append({
@@ -168,39 +179,6 @@ def main():
 
     train_dataset = Dataset.from_list(train_data)
     val_dataset = Dataset.from_list(val_data)
-
-    # Reward function that uses gold answer from dataset
-    def reward_func(prompts, completions, **kwargs):
-        rewards = []
-        for prompt, completion in zip(prompts, completions):
-            pred_answer = extract_answer(completion)
-            pred_evidence = extract_evidence(completion)
-            
-            # Find matching task to get gold answer
-            gold_answer = ""
-            for item in train_data:
-                if item["prompt"] == prompt:
-                    gold_answer = item["gold_answer"]
-                    gold_doc_ids = item["gold_doc_ids"]
-                    break
-            
-            # Answer F1
-            answer_f1 = f1_score(pred_answer, gold_answer)
-            
-            # Evidence recall
-            pred_doc_ids = set(pred_evidence)
-            gold_doc_ids_set = set(gold_doc_ids)
-            evidence_recall = len(gold_doc_ids_set & pred_doc_ids) / len(gold_doc_ids_set) if gold_doc_ids_set else 0.0
-            
-            # Format reward
-            has_result = '<result>' in completion and '</result>' in completion
-            has_evidence = 'evidence:' in completion.lower()
-            format_reward = 0.3 * has_result + 0.2 * has_evidence
-            
-            reward = 0.5 * answer_f1 + 0.3 * evidence_recall + format_reward
-            rewards.append(reward)
-        
-        return rewards
 
     # GRPO Config
     grpo_config = GRPOConfig(
@@ -237,7 +215,7 @@ def main():
     print("Initializing GRPOTrainer...")
     trainer = GRPOTrainer(
         model=model,
-        reward_funcs=reward_func,
+        reward_funcs=hotpotqa_reward_func,
         args=grpo_config,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
