@@ -144,8 +144,8 @@ class HotpotQAEnvironment:
 
     @staticmethod
     def extract_result(text: str) -> str:
-        m = re.search(r"<result>\s*(.*?)\s*</result>", text, re.DOTALL)
-        return m.group(1).strip() if m else ""
+        matches = re.findall(r"<result>\s*(.*?)\s*</result>", text, re.DOTALL)
+        return matches[-1].strip() if matches else ""
 
     @staticmethod
     def extract_doc_ids(text: str) -> List[str]:

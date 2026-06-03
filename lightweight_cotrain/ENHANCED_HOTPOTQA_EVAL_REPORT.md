@@ -813,3 +813,79 @@ The next real improvement should be dynamic SFT with replay/mixture:
   - add dynamic multi-subtask samples
 Then evaluate dynamic and fixed protocols together before any dynamic GRPO.
 ```
+
+## Dynamic Mixture SFT and Reward Fix
+
+Follow-up implementation:
+```text
+generate_hotpotqa_dynamic_mixture_sft_data.py
+hotpotqa_dynamic_mixture_sft_data_300_v3.jsonl
+```
+
+Two important fixes were added:
+```text
+1. Dynamic Main planning now receives an explicit document catalog:
+   Question + Available documents: Dxx: title
+
+2. HotpotQAEnvironment.reward() now scores the last <result> block.
+   MAS rollouts contain intermediate Sub <result> blocks before Main's final answer,
+   so scoring the first <result> can accidentally evaluate the Sub summary instead of Main final.
+```
+
+Why the document catalog matters:
+```text
+Earlier dynamic Main was asked to emit focused subtasks such as:
+  Find evidence from document D16 (...)
+
+But the plan prompt only contained the question, not the local document list.
+On validation, Main therefore guessed Dxx/title IDs. This made dynamic routing unstable.
+```
+
+Mixture v3 training:
+```text
+300 enhanced HotpotQA train tasks
+4200 SFT samples
+1200 Main samples
+3000 Sub samples
+fixed protocol replay + dynamic focused subtasks
+epochs = 1
+lr = 5e-5
+max_length = 1536
+main loss = 0.0298
+sub loss = 0.0721
+```
+
+20-task hard validation, offset 0, samples 2:
+| Model / Protocol | direct_rate | avg_subtasks | answer_f1 | evidence | reward | best_answer_f1 | best_reward |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Staged best / fixed MAS | - | - | 0.456 | 0.537 | 0.527 | 0.574 | 0.617 |
+| Dynamic mixture v3 / dynamic MAS | 0.000 | 1.800 | 0.224 | 0.675 | 0.392 | 0.248 | 0.418 |
+| Dynamic mixture v3 / fixed MAS | - | - | 0.388 | 0.450 | 0.462 | 0.400 | 0.475 |
+
+Current interpretation:
+```text
+The dynamic system is no longer mainly failing at evidence selection:
+  evidence = 0.675 under dynamic MAS.
+
+The remaining bottleneck is final answer synthesis:
+  answer_f1 = 0.224 under dynamic MAS.
+
+So dynamic multi-Sub routing has partially worked:
+  Main can produce ~1.8 subtasks and select better evidence when given document titles.
+
+But Main has not learned to synthesize multiple focused Sub results into one clean final answer.
+```
+
+Next recommended experiment:
+```text
+Do not start dynamic GRPO yet.
+First build a Main-answer-only continuation set where:
+  - Sub results contain focused evidence snippets, not full answer strings.
+  - Main is trained to produce one clean <result>answer | evidence: ...</result>.
+  - Sub adapter is frozen.
+
+Then evaluate:
+  1. dynamic evidence stays high
+  2. dynamic answer_f1 rises
+  3. fixed MAS degradation remains bounded
+```

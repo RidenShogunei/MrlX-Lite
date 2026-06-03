@@ -16,6 +16,10 @@ from generate_hotpotqa_mas_sft_data import (
 from hotpotqa_environment import HotpotQAEnvironment, HotpotTask
 
 
+def doc_catalog(task: HotpotTask) -> str:
+    return "\n".join(f"{doc.doc_id}: {doc.title}" for doc in task.docs)
+
+
 DYNAMIC_MAIN_PLAN_SYSTEM = (
     "You are the main coordinator agent. Decide whether to answer directly or delegate research.\n"
     "If no external research is needed, output:\n"
@@ -76,7 +80,7 @@ def build_main_plan_sample(task: HotpotTask, idx: int, max_subtasks: int, direct
     return {
         "messages": [
             {"role": "system", "content": DYNAMIC_MAIN_PLAN_SYSTEM},
-            {"role": "user", "content": f"Question: {task.question}"},
+            {"role": "user", "content": f"Question: {task.question}\nAvailable documents:\n{doc_catalog(task)}"},
             {"role": "assistant", "content": content},
         ],
         "category": "main",

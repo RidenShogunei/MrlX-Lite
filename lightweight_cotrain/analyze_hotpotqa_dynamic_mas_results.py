@@ -21,6 +21,10 @@ from generate_hotpotqa_mas_sft_data import MAIN_ANSWER_SYSTEM, SUB_ACTION_SYSTEM
 from hotpotqa_environment import HotpotQAEnvironment
 
 
+def doc_catalog(task) -> str:
+    return "\n".join(f"{doc.doc_id}: {doc.title}" for doc in task.docs)
+
+
 DYNAMIC_MAIN_PLAN_SYSTEM = (
     "You are the main coordinator agent. Decide whether to answer directly or delegate research.\n"
     "If the question can be answered directly from known evidence, output:\n"
@@ -109,7 +113,11 @@ def evaluate(model, tokenizer, tasks, device: str, samples: int, max_tokens: int
         task_best_reward = 0.0
         task_best_answer = 0.0
         for _ in range(samples):
-            plan_prompt = build_prompt(tokenizer, DYNAMIC_MAIN_PLAN_SYSTEM, f"Question: {task.question}")
+            plan_prompt = build_prompt(
+                tokenizer,
+                DYNAMIC_MAIN_PLAN_SYSTEM,
+                f"Question: {task.question}\nAvailable documents:\n{doc_catalog(task)}",
+            )
             plan_raw = generate_one(model, tokenizer, "main", plan_prompt, device, max_tokens)
             mode = extract_mode(plan_raw)
             subtasks = extract_subtasks(plan_raw, max_subagents)
