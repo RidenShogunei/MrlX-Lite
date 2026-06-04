@@ -32,6 +32,8 @@ hotpotqa_dynamic_mixture_*sft_*/
 hotpotqa_dynamic_synthesis_*mainonly_*/
 hotpotqa_dynamic_sub_evidence_*/
 hotpotqa_dynamic_sub_evidence*_data_*.jsonl
+hotpotqa_dynamic_verifier_*/
+hotpotqa_dynamic_verifier*_data_*.jsonl
 
 # Evaluation output directories; summaries are captured in reports
 hotpotqa_*_eval_*/

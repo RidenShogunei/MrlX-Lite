@@ -1091,3 +1091,72 @@ The better path is a verifier/synthesis-style Main objective:
   - expose Main to conflicting/partial Sub outputs;
   - train Main to ground the final answer in evidence, not blindly copy a Sub guess.
 ```
+
+## Main Verifier/Synthesis SFT
+
+Implemented:
+```text
+generate_hotpotqa_dynamic_verifier_sft_data.py
+```
+
+Purpose:
+```text
+Freeze the current dynamic mixture Sub.
+Continue training only Main from synthesis 500x1.
+Expose Main to noisy Sub results:
+  - gold evidence-only sub results
+  - wrong-first conflicting sub result
+  - extra distractor sub result
+  - partial gold evidence plus distractor
+Target remains:
+  <result>gold_answer | evidence: gold_doc_ids</result>
+```
+
+Training:
+```text
+data       = hotpotqa_dynamic_verifier_sft_data_500.jsonl
+samples    = 500 tasks x 3 variants = 1500 Main-only samples
+start Main = hotpotqa_dynamic_synthesis_mainonly_500x1/main_agent
+Sub        = frozen hotpotqa_dynamic_mixture_sft_300x1_v3/sub_agent
+epochs     = 1
+lr         = 2e-5
+max_length = 1536
+loss       = 0.0845
+```
+
+Hard offset-40 slice, samples 2:
+| Main checkpoint | answer_f1 | evidence | reward | best_answer_f1 | best_reward |
+|---|---:|---:|---:|---:|---:|
+| synthesis 500x1 | 0.137 | 0.675 | 0.331 | 0.140 | 0.338 |
+| verifier 500x1 | 0.312 | 0.675 | 0.454 | 0.500 | 0.600 |
+
+Multi-offset validation:
+| offset | answer_f1 | evidence | reward | best_answer_f1 | best_reward |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0.400 | 0.750 | 0.530 | 0.400 | 0.540 |
+| 20 | 0.317 | 0.450 | 0.412 | 0.417 | 0.482 |
+| 40 | 0.312 | 0.675 | 0.454 | 0.500 | 0.600 |
+| 60 | 0.220 | 0.600 | 0.374 | 0.407 | 0.525 |
+| 80 | 0.400 | 0.500 | 0.480 | 0.550 | 0.605 |
+| average | 0.330 | 0.595 | 0.450 | 0.455 | 0.550 |
+
+Compared with previous dynamic synthesis 500x1 average:
+```text
+answer_f1      0.344 -> 0.330
+evidence       0.655 -> 0.595
+reward         0.472 -> 0.450
+best_answer_f1 0.394 -> 0.455
+best_reward    0.516 -> 0.550
+```
+
+Interpretation:
+```text
+Verifier SFT is not a drop-in replacement for synthesis 500x1.
+It improves the hard offset-40 slice and improves best-of-samples metrics,
+but the average single-sample reward is worse.
+
+This suggests the model has learned a useful verifier mode, but it is unstable:
+some samples are better, some are worse.
+The next step should use verifier as a selection/reranking signal or distill best-of outputs,
+not simply replace the deployed Main checkpoint.
+```
