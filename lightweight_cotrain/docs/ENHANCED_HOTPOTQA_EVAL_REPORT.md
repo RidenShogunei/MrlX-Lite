@@ -1374,3 +1374,132 @@ The next step is Plancraft-specific SFT before RL:
   - impossible accuracy
   - subplan/delegation usage
 ```
+
+## Plancraft MAS SFT Data
+
+Question:
+```text
+Does Plancraft already provide oracle SFT data?
+```
+
+Answer:
+```text
+It provides benchmark examples and oracle planners/subplans, but not our
+Main/Sub JSONL format for sft_trainer.py.
+
+The package has a PlancraftDialogueDataset loader for oracle_trajectories/*
+directories, but those trajectory files are not bundled in the installed package,
+and that format is single-dialogue oriented rather than our category=main/sub
+adapter split.
+```
+
+Implemented:
+```text
+generate_plancraft_mas_sft_data.py
+```
+
+Data construction:
+```text
+For each Plancraft train example:
+  1. Reset official PlancraftGymWrapper.
+  2. Ask the official oracle planner for subplans.
+  3. For each low-level move/smelt/impossible action:
+       Sub sample:
+         observation + history -> next action advice
+       Main sample:
+         observation + history + Sub advice -> executable action
+  4. Step the environment with the oracle action and continue.
+```
+
+Smoke data:
+```text
+5 train examples -> 30 samples
+main = 15
+sub  = 15
+```
+
+Plancraft SFT50 data:
+```text
+50 train examples -> 634 samples
+main = 317
+sub  = 317
+```
+
+Tried larger data:
+```text
+300 train examples -> 4036 samples
+main = 2018
+sub  = 2018
+```
+
+But 300-example SFT exceeded one hour on the RTX 4060 Laptop GPU and did not
+reach the end-of-epoch save point, so it was stopped. The current trainer only
+saves after each adapter finishes an epoch, so larger Plancraft SFT needs either
+smaller shards or mid-epoch checkpointing.
+
+SFT50 training:
+```text
+base_model = Qwen2.5-1.5B-Instruct local
+data       = plancraft_mas_sft_data_50.jsonl
+epochs     = 1
+lr         = 2e-4
+max_length = 1536
+save_dir   = plancraft_mas_sft_50x1
+```
+
+Training result:
+```text
+Main prepared samples = 236 / 317
+Main loss = 0.0015
+Sub prepared samples = 235 / 317
+Sub loss = 0.2258
+```
+
+The prepared sample count is lower than raw sample count because long history
+prompts can be truncated so aggressively that no assistant target tokens remain.
+This needs a shorter history window or larger max_length for larger runs.
+
+Important evaluator bug fixed:
+```text
+analyze_plancraft_mas_results.py originally reused HotpotQA generate_one(),
+which prepended <thinking> to every generation.
+
+Plancraft SFT targets are action-only strings, so the evaluator now uses
+generate_action() with no forced prefix.
+```
+
+SFT50 easy validation smoke:
+```text
+split = val.small.easy
+tasks = 5
+max_steps = 10
+checkpoint = plancraft_mas_sft_50x1
+```
+
+Result:
+```text
+success_rate = 0.400
+reward = 0.400
+avg_steps = 6.800
+invalid_action_rate = 0.280
+```
+
+Compared with zero-shot HotpotQA MAS checkpoint:
+```text
+success_rate = 0.000
+invalid_action_rate = 1.000
+```
+
+Interpretation:
+```text
+The Plancraft SFT adapter is learning the action syntax and can solve simple
+held-out crafting tasks.
+
+Remaining failures are mostly:
+  - invalid slots such as [A4]
+  - repeated actions after the source slot has changed
+  - weak state tracking after each environment transition
+
+The next useful step is to improve data/windowing and train a larger
+Plancraft-specific SFT checkpoint before any RL comparison.
+```

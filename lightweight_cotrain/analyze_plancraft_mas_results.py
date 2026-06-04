@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from analyze_hotpotqa_mas_results import build_prompt, generate_one, load_model
+from analyze_hotpotqa_mas_results import build_prompt, load_model, set_adapter
 from plancraft_environment import PlancraftBenchEpisode, load_examples
 
 
@@ -42,6 +42,25 @@ def history_text(history: list[tuple[str, str, str]]) -> str:
     return "\n".join(lines[-18:])
 
 
+def generate_action(model, tokenizer, adapter: str, prompt: str, device: str, max_tokens: int):
+    set_adapter(model, adapter)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    inputs = {key: value.to(device) for key, value in inputs.items()}
+    with torch.no_grad():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            temperature=0.2,
+            top_p=0.9,
+            do_sample=True,
+            repetition_penalty=1.05,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    text = tokenizer.decode(output[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True).strip()
+    return text.splitlines()[0].strip() if text else ""
+
+
 def run_mas_episode(model, tokenizer, example, device: str, max_steps: int, max_tokens: int):
     episode = PlancraftBenchEpisode(example, max_steps=max_steps)
     observation = episode.reset()
@@ -53,7 +72,7 @@ def run_mas_episode(model, tokenizer, example, device: str, max_steps: int, max_
             SUB_SYSTEM,
             f"Current observation:\n{observation}\n\nHistory:\n{history_text(history)}",
         )
-        sub_raw = generate_one(model, tokenizer, "sub", sub_prompt, device, max_tokens)
+        sub_raw = generate_action(model, tokenizer, "sub", sub_prompt, device, max_tokens)
         main_prompt = build_prompt(
             tokenizer,
             MAIN_SYSTEM,
@@ -63,7 +82,7 @@ def run_mas_episode(model, tokenizer, example, device: str, max_steps: int, max_
                 f"Sub agent advice:\n{sub_raw}"
             ),
         )
-        main_raw = generate_one(model, tokenizer, "main", main_prompt, device, max_tokens)
+        main_raw = generate_action(model, tokenizer, "main", main_prompt, device, max_tokens)
         observation, reward, terminated, truncated, info = episode.step(main_raw)
         history.append((sub_raw, main_raw, observation))
         trace.append(
