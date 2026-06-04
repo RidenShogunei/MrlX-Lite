@@ -2,6 +2,7 @@
 
 import argparse
 import random
+import re
 from pathlib import Path
 
 import torch
@@ -9,11 +10,15 @@ import torch
 from analyze_hotpotqa_mas_results import build_prompt
 from analyze_plancraft_mas_results import MAIN_SYSTEM, SUB_SYSTEM, history_text
 from grpo_v4 import CoTrainConfig, SharedModel
-from plancraft_environment import PlancraftBenchEpisode, load_examples
+from plancraft_environment import PlancraftBenchEpisode, flatten_subplans, load_examples
 
 
 def first_line(text: str) -> str:
     return text.strip().splitlines()[0].strip() if text.strip() else ""
+
+
+def normalize_action(text: str) -> str:
+    return re.sub(r"\s+", " ", first_line(text).lower()).strip()
 
 
 class PlancraftMASGRPOTrainer:
@@ -27,6 +32,13 @@ class PlancraftMASGRPOTrainer:
         valid_weight: float = 0.2,
         step_penalty: float = 0.01,
         eval_samples: int = 1,
+        main_success_weight: float = 1.0,
+        main_valid_weight: float = 0.2,
+        main_oracle_weight: float = 0.2,
+        sub_global_weight: float = 0.5,
+        sub_valid_weight: float = 0.3,
+        sub_oracle_weight: float = 0.5,
+        sub_agreement_weight: float = 0.2,
     ):
         self.config = config
         self.max_steps = max_steps
@@ -36,6 +48,13 @@ class PlancraftMASGRPOTrainer:
         self.valid_weight = valid_weight
         self.step_penalty = step_penalty
         self.eval_samples = max(eval_samples, 1)
+        self.main_success_weight = main_success_weight
+        self.main_valid_weight = main_valid_weight
+        self.main_oracle_weight = main_oracle_weight
+        self.sub_global_weight = sub_global_weight
+        self.sub_valid_weight = sub_valid_weight
+        self.sub_oracle_weight = sub_oracle_weight
+        self.sub_agreement_weight = sub_agreement_weight
         self.save_dir = Path(config.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.model = None
@@ -68,24 +87,73 @@ class PlancraftMASGRPOTrainer:
             ),
         )
 
-    def candidate_reward(self, result) -> float:
-        valid_rate = result.valid_action_count / max(result.action_count, 1)
-        return (
-            (1.0 if result.success else 0.0)
-            + self.valid_weight * valid_rate
+    @staticmethod
+    def action_is_valid(episode: PlancraftBenchEpisode, action: str) -> bool:
+        try:
+            return not isinstance(episode.wrapper.parse_raw_model_response(action), str)
+        except Exception:
+            return False
+
+    @staticmethod
+    def oracle_next_action(episode: PlancraftBenchEpisode) -> str:
+        try:
+            actions = flatten_subplans(episode.oracle_subplans())
+        except Exception:
+            return ""
+        return first_line(actions[0]) if actions else ""
+
+    @staticmethod
+    def action_matches_oracle(action: str, oracle_action: str) -> bool:
+        if not action or not oracle_action:
+            return False
+        return normalize_action(action) == normalize_action(oracle_action)
+
+    def candidate_rewards(self, result, step_scores) -> tuple[float, float]:
+        success = 1.0 if result.success else 0.0
+        main_valid = self.average(step_scores, "main_valid")
+        main_oracle = self.average(step_scores, "main_oracle_match")
+        sub_valid = self.average(step_scores, "sub_valid")
+        sub_oracle = self.average(step_scores, "sub_oracle_match")
+        sub_agreement = self.average(step_scores, "sub_main_agreement")
+        main_reward = (
+            self.main_success_weight * success
+            + self.main_valid_weight * main_valid
+            + self.main_oracle_weight * main_oracle
             - self.step_penalty * result.steps
         )
+        sub_reward = (
+            self.sub_global_weight * success
+            + self.sub_valid_weight * sub_valid
+            + self.sub_oracle_weight * sub_oracle
+            + self.sub_agreement_weight * sub_agreement
+            - self.step_penalty * result.steps
+        )
+        return main_reward, sub_reward
 
     def generate_candidate(self, example):
         episode = PlancraftBenchEpisode(example, max_steps=self.max_steps)
         observation = episode.reset()
         history = []
         steps = []
+        step_scores = []
         for _step in range(self.max_steps):
+            oracle_action = self.oracle_next_action(episode)
             sub_prompt = self.build_sub_prompt(observation, history)
             sub_raw = self.generate_action(SharedModel.SUB_ADAPTER, sub_prompt)
             main_prompt = self.build_main_prompt(observation, history, sub_raw)
             main_raw = self.generate_action(SharedModel.MAIN_ADAPTER, main_prompt)
+            sub_norm = normalize_action(sub_raw)
+            main_norm = normalize_action(main_raw)
+            oracle_norm = normalize_action(oracle_action)
+            step_scores.append(
+                {
+                    "sub_valid": 1.0 if self.action_is_valid(episode, sub_raw) else 0.0,
+                    "main_valid": 1.0 if self.action_is_valid(episode, main_raw) else 0.0,
+                    "sub_oracle_match": 1.0 if sub_norm and sub_norm == oracle_norm else 0.0,
+                    "main_oracle_match": 1.0 if main_norm and main_norm == oracle_norm else 0.0,
+                    "sub_main_agreement": 1.0 if sub_norm and sub_norm == main_norm else 0.0,
+                }
+            )
             observation, _reward, terminated, truncated, _info = episode.step(main_raw)
             steps.append(
                 {
@@ -93,6 +161,7 @@ class PlancraftMASGRPOTrainer:
                     "sub_raw": sub_raw,
                     "main_prompt": main_prompt,
                     "main_raw": main_raw,
+                    "oracle_action": oracle_action,
                 }
             )
             history.append((sub_raw, main_raw, observation))
@@ -100,45 +169,59 @@ class PlancraftMASGRPOTrainer:
                 break
         result = episode.result()
         valid_rate = result.valid_action_count / max(result.action_count, 1)
-        reward = self.candidate_reward(result)
+        main_reward, sub_reward = self.candidate_rewards(result, step_scores)
         return {
             "steps": steps,
             "result": result,
-            "reward": reward,
+            "reward": main_reward,
+            "main_reward": main_reward,
+            "sub_reward": sub_reward,
             "success": 1.0 if result.success else 0.0,
             "valid_rate": valid_rate,
             "invalid_rate": result.invalid_action_count / max(result.action_count, 1),
             "env_reward": result.reward,
             "step_count": result.steps,
+            "main_valid": self.average(step_scores, "main_valid"),
+            "sub_valid": self.average(step_scores, "sub_valid"),
+            "main_oracle_match": self.average(step_scores, "main_oracle_match"),
+            "sub_oracle_match": self.average(step_scores, "sub_oracle_match"),
+            "sub_main_agreement": self.average(step_scores, "sub_main_agreement"),
         }
 
-    def group_advantages(self, candidates):
-        values = [cand["reward"] for cand in candidates]
+    def group_advantages(self, candidates, reward_key: str, advantage_key: str):
+        values = [cand[reward_key] for cand in candidates]
         mean = sum(values) / max(len(values), 1)
         var = sum((value - mean) ** 2 for value in values) / max(len(values), 1)
         std = max(var ** 0.5, 1e-6)
         for cand, value in zip(candidates, values):
             adv = (value - mean) / std
-            cand["advantage"] = max(min(adv, self.advantage_clip), -self.advantage_clip)
+            cand[advantage_key] = max(min(adv, self.advantage_clip), -self.advantage_clip)
         return candidates
 
     def run_group(self, example):
         candidates = [self.generate_candidate(example) for _ in range(self.config.group_size)]
-        self.group_advantages(candidates)
-        candidates.sort(key=lambda cand: (cand["reward"], cand["success"], cand["valid_rate"]), reverse=True)
+        self.group_advantages(candidates, "main_reward", "main_advantage")
+        self.group_advantages(candidates, "sub_reward", "sub_advantage")
+        candidates.sort(key=lambda cand: (cand["main_reward"], cand["success"], cand["valid_rate"]), reverse=True)
         return candidates
 
     def apply_advantage_update(self, candidates):
         main_updates, sub_updates = 0, 0
         for cand in candidates:
-            adv = cand["advantage"]
-            if abs(adv) < self.min_advantage:
-                continue
+            main_adv = cand["main_advantage"]
+            sub_adv = cand["sub_advantage"]
             for step in cand["steps"]:
-                self.model.sft_step(SharedModel.SUB_ADAPTER, step["sub_prompt"], step["sub_raw"], weight=adv)
-                self.model.sft_step(SharedModel.MAIN_ADAPTER, step["main_prompt"], step["main_raw"], weight=adv)
-                sub_updates += 1
-                main_updates += 1
+                if abs(sub_adv) >= self.min_advantage:
+                    self.model.sft_step(SharedModel.SUB_ADAPTER, step["sub_prompt"], step["sub_raw"], weight=sub_adv)
+                    sub_updates += 1
+                if abs(main_adv) >= self.min_advantage:
+                    self.model.sft_step(
+                        SharedModel.MAIN_ADAPTER,
+                        step["main_prompt"],
+                        step["main_raw"],
+                        weight=main_adv,
+                    )
+                    main_updates += 1
         return main_updates, sub_updates
 
     @staticmethod
@@ -166,9 +249,16 @@ class PlancraftMASGRPOTrainer:
             "best_success_rate": self.average(best_rows.values(), "success"),
             "reward": self.average(rows, "reward"),
             "best_reward": self.average(best_rows.values(), "reward"),
+            "main_reward": self.average(rows, "main_reward"),
+            "sub_reward": self.average(rows, "sub_reward"),
             "env_reward": self.average(rows, "env_reward"),
             "valid_rate": self.average(rows, "valid_rate"),
             "invalid_rate": self.average(rows, "invalid_rate"),
+            "main_valid": self.average(rows, "main_valid"),
+            "sub_valid": self.average(rows, "sub_valid"),
+            "main_oracle_match": self.average(rows, "main_oracle_match"),
+            "sub_oracle_match": self.average(rows, "sub_oracle_match"),
+            "sub_main_agreement": self.average(rows, "sub_main_agreement"),
             "avg_steps": self.average(rows, "step_count"),
         }
 
@@ -198,6 +288,13 @@ class PlancraftMASGRPOTrainer:
             f"[plancraft-mas-grpo] max_steps={self.max_steps} valid_weight={self.valid_weight} "
             f"step_penalty={self.step_penalty} best_metric={self.best_metric}"
         )
+        print(
+            "[plancraft-mas-grpo] reward weights "
+            f"main=(success:{self.main_success_weight}, valid:{self.main_valid_weight}, "
+            f"oracle:{self.main_oracle_weight}) "
+            f"sub=(global:{self.sub_global_weight}, valid:{self.sub_valid_weight}, "
+            f"oracle:{self.sub_oracle_weight}, agree:{self.sub_agreement_weight})"
+        )
         print(f"[plancraft-mas-grpo] eval_samples={self.eval_samples}")
         self.model = SharedModel(self.config.base_model, self.config)
         self.model.load_sft_weights()
@@ -208,8 +305,10 @@ class PlancraftMASGRPOTrainer:
         print(
             f"  [val:init] success={init['success_rate']:.3f} reward={init['reward']:.3f} "
             f"best_success={init['best_success_rate']:.3f} best_reward={init['best_reward']:.3f} "
+            f"main_reward={init['main_reward']:.3f} sub_reward={init['sub_reward']:.3f} "
             f"env_reward={init['env_reward']:.3f} valid={init['valid_rate']:.3f} "
-            f"invalid={init['invalid_rate']:.3f} steps={init['avg_steps']:.3f}"
+            f"invalid={init['invalid_rate']:.3f} steps={init['avg_steps']:.3f} "
+            f"main_oracle={init['main_oracle_match']:.3f} sub_oracle={init['sub_oracle_match']:.3f}"
         )
         self.save_best()
 
@@ -225,18 +324,24 @@ class PlancraftMASGRPOTrainer:
                 sub_updates += u_sub
             print(
                 f"  train success={self.average(rows, 'success'):.3f} "
-                f"reward={self.average(rows, 'reward'):.3f} "
+                f"main_reward={self.average(rows, 'main_reward'):.3f} "
+                f"sub_reward={self.average(rows, 'sub_reward'):.3f} "
                 f"valid={self.average(rows, 'valid_rate'):.3f} "
                 f"invalid={self.average(rows, 'invalid_rate'):.3f} "
                 f"steps={self.average(rows, 'step_count'):.3f} "
+                f"main_oracle={self.average(rows, 'main_oracle_match'):.3f} "
+                f"sub_oracle={self.average(rows, 'sub_oracle_match'):.3f} "
+                f"agree={self.average(rows, 'sub_main_agreement'):.3f} "
                 f"updates main={main_updates} sub={sub_updates}"
             )
             val = self.evaluate(val_examples)
             print(
                 f"  [val] success={val['success_rate']:.3f} reward={val['reward']:.3f} "
                 f"best_success={val['best_success_rate']:.3f} best_reward={val['best_reward']:.3f} "
+                f"main_reward={val['main_reward']:.3f} sub_reward={val['sub_reward']:.3f} "
                 f"env_reward={val['env_reward']:.3f} valid={val['valid_rate']:.3f} "
-                f"invalid={val['invalid_rate']:.3f} steps={val['avg_steps']:.3f}"
+                f"invalid={val['invalid_rate']:.3f} steps={val['avg_steps']:.3f} "
+                f"main_oracle={val['main_oracle_match']:.3f} sub_oracle={val['sub_oracle_match']:.3f}"
             )
             score = self.validation_score(val)
             if score > best_val:
@@ -272,6 +377,13 @@ def parse_args():
     parser.add_argument("--min-advantage", type=float, default=0.01)
     parser.add_argument("--valid-weight", type=float, default=0.2)
     parser.add_argument("--step-penalty", type=float, default=0.01)
+    parser.add_argument("--main-success-weight", type=float, default=1.0)
+    parser.add_argument("--main-valid-weight", type=float, default=0.2)
+    parser.add_argument("--main-oracle-weight", type=float, default=0.2)
+    parser.add_argument("--sub-global-weight", type=float, default=0.5)
+    parser.add_argument("--sub-valid-weight", type=float, default=0.3)
+    parser.add_argument("--sub-oracle-weight", type=float, default=0.5)
+    parser.add_argument("--sub-agreement-weight", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=123)
     return parser.parse_args()
 
@@ -302,6 +414,13 @@ def main():
         valid_weight=args.valid_weight,
         step_penalty=args.step_penalty,
         eval_samples=args.eval_samples,
+        main_success_weight=args.main_success_weight,
+        main_valid_weight=args.main_valid_weight,
+        main_oracle_weight=args.main_oracle_weight,
+        sub_global_weight=args.sub_global_weight,
+        sub_valid_weight=args.sub_valid_weight,
+        sub_oracle_weight=args.sub_oracle_weight,
+        sub_agreement_weight=args.sub_agreement_weight,
     ).train(train_examples, val_examples, iterations=args.iterations)
 
 

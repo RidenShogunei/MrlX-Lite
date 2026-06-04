@@ -1612,3 +1612,131 @@ advantage signal is high variance. The next improvement should be either:
   - denser trajectory-level reward for subgoal progress,
   - or a stronger Plancraft SFT base before RL.
 ```
+
+## Plancraft M-GRPO-Style Reward Split
+
+Changed:
+```text
+grpo_plancraft_mas.py
+```
+
+The previous Plancraft GRPO used one trajectory-level reward for both Main and
+Sub. This has now been changed to a lightweight M-GRPO-style credit assignment:
+
+```text
+Main reward =
+  main_success_weight * episode_success
++ main_valid_weight   * main_action_valid_rate
++ main_oracle_weight  * main_oracle_action_match_rate
+- step_penalty        * steps
+
+Sub reward =
+  sub_global_weight    * episode_success
++ sub_valid_weight     * sub_advice_valid_rate
++ sub_oracle_weight    * sub_oracle_action_match_rate
++ sub_agreement_weight * sub_main_action_agreement_rate
+- step_penalty         * steps
+```
+
+Implementation details:
+```text
+For each step:
+  - read official Plancraft oracle next action from current state
+  - check whether Sub advice parses as a valid Plancraft action
+  - check whether Main action parses as a valid Plancraft action
+  - check exact normalized match against oracle next action
+  - check whether Sub and Main produced the same normalized action
+
+For each rollout group:
+  - normalize Main rewards into main_advantage
+  - normalize Sub rewards into sub_advantage
+  - update Main with main_advantage
+  - update Sub with sub_advantage
+```
+
+Smoke:
+```text
+train = 1
+val = 1
+iterations = 1
+group_size = 2
+max_steps = 3
+eval_samples = 2
+```
+
+Result:
+```text
+val:init success = 1.000
+val:init main_reward = 1.380
+val:init sub_reward = 1.480
+main_oracle = 1.000
+sub_oracle = 1.000
+
+train success = 0.000
+updates main/sub = 0 / 0
+```
+
+Interpretation:
+```text
+The split-reward code path works. The one-task group still had no useful
+advantage difference, so it produced no updates.
+```
+
+Small M-GRPO-style run:
+```text
+train = 5
+val = 5
+iterations = 1
+group_size = 2
+max_steps = 8
+eval_samples = 2
+lr = 1e-7
+save_dir = plancraft_mas_grpo_mgrpo_5x1
+```
+
+Result:
+```text
+val:init success = 0.400
+val:init main_reward = 0.599
+val:init sub_reward = 0.792
+val:init main_oracle = 0.350
+val:init sub_oracle = 0.350
+
+train success = 0.200
+train main_reward = 0.322
+train sub_reward = 0.537
+train valid_rate = 0.850
+train main_oracle = 0.100
+train sub_oracle = 0.100
+train sub/main agreement = 1.000
+updates main/sub = 26 / 26
+
+val success = 0.200
+val main_reward = 0.327
+val sub_reward = 0.540
+val valid_rate = 0.838
+val main_oracle = 0.100
+val sub_oracle = 0.100
+```
+
+Interpretation:
+```text
+The M-GRPO-style reward split produces real independent Main/Sub advantages and
+more updates than the shared-reward version.
+
+But validation still drops from 0.400 to 0.200 on this small setting, so this is
+not yet an improvement over SFT. The best checkpoint remains the initialized SFT
+checkpoint.
+
+The important diagnostic is sub/main agreement = 1.000. Sub is not yet behaving
+like an independent helper; it mostly mirrors the executable action Main will
+take. That means the current Sub reward is too shallow. Exact oracle match and
+format validity are not enough to teach useful decomposition.
+
+Next reward improvement should move from action-level exact match to state-level
+progress:
+  - reward creating/intermediate target ingredients,
+  - reward reducing missing recipe requirements,
+  - penalize repeated no-op moves,
+  - reward Sub advice that would improve state even if Main does not copy it.
+```
