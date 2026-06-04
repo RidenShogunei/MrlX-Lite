@@ -2056,3 +2056,125 @@ held-out validation on this small run. That reinforces the current bottleneck:
 the action-level reward split is not enough. The next GRPO improvement should
 use state-progress reward, not more tiny action-match tuning.
 ```
+
+## State-Progress Reward for Plancraft GRPO
+
+Changed:
+```text
+grpo_plancraft_mas.py
+```
+
+Added state-progress reward:
+```text
+oracle_steps_before = len(official_oracle_subplans(current_state))
+execute Main action
+oracle_steps_after = len(official_oracle_subplans(next_state))
+oracle_progress = clamp((before - after) / before, -1.0, 1.0)
+```
+
+Reward now includes:
+```text
+Main reward =
+  success
++ valid action reward
++ oracle exact action match
++ main_progress_weight * oracle_progress
+- step penalty
+
+Sub reward =
+  partial global success
++ valid structured action reward
++ oracle exact action match
++ sub_progress_weight * oracle_progress
++ sub/main agreement
+- step penalty
+```
+
+Why this matters:
+```text
+Exact oracle action match is too brittle. In Plancraft, several actions can be
+equivalent or at least non-harmful. The new progress term rewards actions that
+reduce the remaining official plan length, so it is closer to state-level credit
+assignment than pure action imitation.
+```
+
+Smoke:
+```text
+init = plancraft_mas_structured_short_sft_200x1
+train = 1
+val = 1
+group_size = 2
+max_steps = 5
+eval_samples = 2
+structured_sub = true
+```
+
+Result:
+```text
+val:init success = 0.500
+val:init best_success = 1.000
+val:init progress = 0.396
+
+train success = 0.000
+train progress = 0.327
+updates main/sub = 9 / 9
+
+val success = 1.000
+val progress = 0.750
+```
+
+Interpretation:
+```text
+The new reward path works. Correct validation trajectories have much higher
+progress, so the metric is meaningful.
+```
+
+Progress-GRPO 5x1:
+```text
+init = plancraft_mas_structured_short_sft_200x1
+train = 5
+val = 5
+iterations = 1
+group_size = 2
+lr = 5e-8
+advantage_clip = 0.5
+eval_samples = 2
+structured_sub = true
+```
+
+Result:
+```text
+val:init success = 0.500
+val:init best_success = 0.600
+val:init progress = 0.671
+
+train success = 0.600
+train valid_rate = 1.000
+train progress = 0.800
+updates main/sub = 23 / 23
+
+val success = 0.300
+val best_success = 0.400
+val progress = 0.442
+```
+
+Interpretation:
+```text
+State-progress reward makes the training rollouts look genuinely better:
+validity is perfect, success is high, and oracle progress is high.
+
+But held-out validation still drops after a small on-policy update. This means
+the reward is more informative, but the current GRPO setting is still too
+high-variance/overfit for 5 training tasks.
+
+The next RL-side experiment should reduce update aggressiveness and improve
+selection stability:
+  - larger validation slice,
+  - group_size >= 4,
+  - more train tasks,
+  - lower or zero update when candidate advantages come from a tiny reward gap,
+  - optional SFT replay mixed into GRPO updates.
+
+Current best checkpoint remains:
+  plancraft_mas_structured_short_sft_200x1
+```

@@ -50,9 +50,11 @@ class PlancraftMASGRPOTrainer:
         main_success_weight: float = 1.0,
         main_valid_weight: float = 0.2,
         main_oracle_weight: float = 0.2,
+        main_progress_weight: float = 0.4,
         sub_global_weight: float = 0.5,
         sub_valid_weight: float = 0.3,
         sub_oracle_weight: float = 0.5,
+        sub_progress_weight: float = 0.6,
         sub_agreement_weight: float = 0.2,
         structured_sub: bool = False,
     ):
@@ -67,9 +69,11 @@ class PlancraftMASGRPOTrainer:
         self.main_success_weight = main_success_weight
         self.main_valid_weight = main_valid_weight
         self.main_oracle_weight = main_oracle_weight
+        self.main_progress_weight = main_progress_weight
         self.sub_global_weight = sub_global_weight
         self.sub_valid_weight = sub_valid_weight
         self.sub_oracle_weight = sub_oracle_weight
+        self.sub_progress_weight = sub_progress_weight
         self.sub_agreement_weight = sub_agreement_weight
         self.structured_sub = structured_sub
         self.save_dir = Path(config.save_dir)
@@ -120,6 +124,15 @@ class PlancraftMASGRPOTrainer:
         return first_line(actions[0]) if actions else ""
 
     @staticmethod
+    def oracle_remaining_steps(episode: PlancraftBenchEpisode) -> int:
+        if episode.terminated or episode.truncated or bool(episode.wrapper.success):
+            return 0
+        try:
+            return len(flatten_subplans(episode.oracle_subplans()))
+        except Exception:
+            return 0
+
+    @staticmethod
     def action_matches_oracle(action: str, oracle_action: str) -> bool:
         if not action or not oracle_action:
             return False
@@ -129,6 +142,7 @@ class PlancraftMASGRPOTrainer:
         success = 1.0 if result.success else 0.0
         main_valid = self.average(step_scores, "main_valid")
         main_oracle = self.average(step_scores, "main_oracle_match")
+        progress = self.average(step_scores, "oracle_progress")
         sub_valid = self.average(step_scores, "sub_valid")
         sub_oracle = self.average(step_scores, "sub_oracle_match")
         sub_agreement = self.average(step_scores, "sub_main_agreement")
@@ -136,12 +150,14 @@ class PlancraftMASGRPOTrainer:
             self.main_success_weight * success
             + self.main_valid_weight * main_valid
             + self.main_oracle_weight * main_oracle
+            + self.main_progress_weight * progress
             - self.step_penalty * result.steps
         )
         sub_reward = (
             self.sub_global_weight * success
             + self.sub_valid_weight * sub_valid
             + self.sub_oracle_weight * sub_oracle
+            + self.sub_progress_weight * progress
             + self.sub_agreement_weight * sub_agreement
             - self.step_penalty * result.steps
         )
@@ -155,6 +171,7 @@ class PlancraftMASGRPOTrainer:
         step_scores = []
         for _step in range(self.max_steps):
             oracle_action = self.oracle_next_action(episode)
+            oracle_steps_before = self.oracle_remaining_steps(episode)
             sub_prompt = self.build_sub_prompt(observation, history)
             sub_raw = self.generate_action(SharedModel.SUB_ADAPTER, sub_prompt, structured=self.structured_sub)
             main_prompt = self.build_main_prompt(observation, history, sub_raw)
@@ -163,16 +180,23 @@ class PlancraftMASGRPOTrainer:
             sub_norm = normalize_action(sub_action)
             main_norm = normalize_action(main_raw)
             oracle_norm = normalize_action(oracle_action)
+            sub_valid = 1.0 if self.action_is_valid(episode, sub_action) else 0.0
+            main_valid = 1.0 if self.action_is_valid(episode, main_raw) else 0.0
+            observation, _reward, terminated, truncated, _info = episode.step(main_raw)
+            oracle_steps_after = self.oracle_remaining_steps(episode)
+            progress = 0.0
+            if main_valid and oracle_steps_before > 0:
+                progress = max(min((oracle_steps_before - oracle_steps_after) / oracle_steps_before, 1.0), -1.0)
             step_scores.append(
                 {
-                    "sub_valid": 1.0 if self.action_is_valid(episode, sub_action) else 0.0,
-                    "main_valid": 1.0 if self.action_is_valid(episode, main_raw) else 0.0,
+                    "sub_valid": sub_valid,
+                    "main_valid": main_valid,
                     "sub_oracle_match": 1.0 if sub_norm and sub_norm == oracle_norm else 0.0,
                     "main_oracle_match": 1.0 if main_norm and main_norm == oracle_norm else 0.0,
                     "sub_main_agreement": 1.0 if sub_norm and sub_norm == main_norm else 0.0,
+                    "oracle_progress": progress,
                 }
             )
-            observation, _reward, terminated, truncated, _info = episode.step(main_raw)
             steps.append(
                 {
                     "sub_prompt": sub_prompt,
@@ -204,6 +228,7 @@ class PlancraftMASGRPOTrainer:
             "main_oracle_match": self.average(step_scores, "main_oracle_match"),
             "sub_oracle_match": self.average(step_scores, "sub_oracle_match"),
             "sub_main_agreement": self.average(step_scores, "sub_main_agreement"),
+            "oracle_progress": self.average(step_scores, "oracle_progress"),
         }
 
     def group_advantages(self, candidates, reward_key: str, advantage_key: str):
@@ -277,6 +302,7 @@ class PlancraftMASGRPOTrainer:
             "main_oracle_match": self.average(rows, "main_oracle_match"),
             "sub_oracle_match": self.average(rows, "sub_oracle_match"),
             "sub_main_agreement": self.average(rows, "sub_main_agreement"),
+            "oracle_progress": self.average(rows, "oracle_progress"),
             "avg_steps": self.average(rows, "step_count"),
         }
 
@@ -309,9 +335,10 @@ class PlancraftMASGRPOTrainer:
         print(
             "[plancraft-mas-grpo] reward weights "
             f"main=(success:{self.main_success_weight}, valid:{self.main_valid_weight}, "
-            f"oracle:{self.main_oracle_weight}) "
+            f"oracle:{self.main_oracle_weight}, progress:{self.main_progress_weight}) "
             f"sub=(global:{self.sub_global_weight}, valid:{self.sub_valid_weight}, "
-            f"oracle:{self.sub_oracle_weight}, agree:{self.sub_agreement_weight})"
+            f"oracle:{self.sub_oracle_weight}, progress:{self.sub_progress_weight}, "
+            f"agree:{self.sub_agreement_weight})"
         )
         print(f"[plancraft-mas-grpo] eval_samples={self.eval_samples} structured_sub={self.structured_sub}")
         self.model = SharedModel(self.config.base_model, self.config)
@@ -326,7 +353,8 @@ class PlancraftMASGRPOTrainer:
             f"main_reward={init['main_reward']:.3f} sub_reward={init['sub_reward']:.3f} "
             f"env_reward={init['env_reward']:.3f} valid={init['valid_rate']:.3f} "
             f"invalid={init['invalid_rate']:.3f} steps={init['avg_steps']:.3f} "
-            f"main_oracle={init['main_oracle_match']:.3f} sub_oracle={init['sub_oracle_match']:.3f}"
+            f"main_oracle={init['main_oracle_match']:.3f} sub_oracle={init['sub_oracle_match']:.3f} "
+            f"progress={init['oracle_progress']:.3f}"
         )
         self.save_best()
 
@@ -349,6 +377,7 @@ class PlancraftMASGRPOTrainer:
                 f"steps={self.average(rows, 'step_count'):.3f} "
                 f"main_oracle={self.average(rows, 'main_oracle_match'):.3f} "
                 f"sub_oracle={self.average(rows, 'sub_oracle_match'):.3f} "
+                f"progress={self.average(rows, 'oracle_progress'):.3f} "
                 f"agree={self.average(rows, 'sub_main_agreement'):.3f} "
                 f"updates main={main_updates} sub={sub_updates}"
             )
@@ -359,7 +388,8 @@ class PlancraftMASGRPOTrainer:
                 f"main_reward={val['main_reward']:.3f} sub_reward={val['sub_reward']:.3f} "
                 f"env_reward={val['env_reward']:.3f} valid={val['valid_rate']:.3f} "
                 f"invalid={val['invalid_rate']:.3f} steps={val['avg_steps']:.3f} "
-                f"main_oracle={val['main_oracle_match']:.3f} sub_oracle={val['sub_oracle_match']:.3f}"
+                f"main_oracle={val['main_oracle_match']:.3f} sub_oracle={val['sub_oracle_match']:.3f} "
+                f"progress={val['oracle_progress']:.3f}"
             )
             score = self.validation_score(val)
             if score > best_val:
@@ -398,9 +428,11 @@ def parse_args():
     parser.add_argument("--main-success-weight", type=float, default=1.0)
     parser.add_argument("--main-valid-weight", type=float, default=0.2)
     parser.add_argument("--main-oracle-weight", type=float, default=0.2)
+    parser.add_argument("--main-progress-weight", type=float, default=0.4)
     parser.add_argument("--sub-global-weight", type=float, default=0.5)
     parser.add_argument("--sub-valid-weight", type=float, default=0.3)
     parser.add_argument("--sub-oracle-weight", type=float, default=0.5)
+    parser.add_argument("--sub-progress-weight", type=float, default=0.6)
     parser.add_argument("--sub-agreement-weight", type=float, default=0.2)
     parser.add_argument("--structured-sub", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--seed", type=int, default=123)
@@ -436,9 +468,11 @@ def main():
         main_success_weight=args.main_success_weight,
         main_valid_weight=args.main_valid_weight,
         main_oracle_weight=args.main_oracle_weight,
+        main_progress_weight=args.main_progress_weight,
         sub_global_weight=args.sub_global_weight,
         sub_valid_weight=args.sub_valid_weight,
         sub_oracle_weight=args.sub_oracle_weight,
+        sub_progress_weight=args.sub_progress_weight,
         sub_agreement_weight=args.sub_agreement_weight,
         structured_sub=args.structured_sub,
     ).train(train_examples, val_examples, iterations=args.iterations)
