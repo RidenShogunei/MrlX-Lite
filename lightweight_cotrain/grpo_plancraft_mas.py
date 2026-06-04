@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 
 from analyze_hotpotqa_mas_results import build_prompt
-from analyze_plancraft_mas_results import MAIN_SYSTEM, SUB_SYSTEM, history_text
+from analyze_plancraft_mas_results import MAIN_SYSTEM, STRUCTURED_SUB_SYSTEM, SUB_SYSTEM, history_text
 from grpo_v4 import CoTrainConfig, SharedModel
 from plancraft_environment import PlancraftBenchEpisode, flatten_subplans, load_examples
 
@@ -19,6 +19,21 @@ def first_line(text: str) -> str:
 
 def normalize_action(text: str) -> str:
     return re.sub(r"\s+", " ", first_line(text).lower()).strip()
+
+
+def extract_structured_action(text: str) -> str:
+    match = re.search(r"<action>(.*?)</action>", text, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return first_line(match.group(1))
+    return first_line(text)
+
+
+def truncate_structured_sub(text: str) -> str:
+    text = text.strip()
+    end = text.find("</action>")
+    if end >= 0:
+        return text[: end + len("</action>")].strip()
+    return "\n".join(text.splitlines()[:3]).strip()
 
 
 class PlancraftMASGRPOTrainer:
@@ -39,6 +54,7 @@ class PlancraftMASGRPOTrainer:
         sub_valid_weight: float = 0.3,
         sub_oracle_weight: float = 0.5,
         sub_agreement_weight: float = 0.2,
+        structured_sub: bool = False,
     ):
         self.config = config
         self.max_steps = max_steps
@@ -55,24 +71,25 @@ class PlancraftMASGRPOTrainer:
         self.sub_valid_weight = sub_valid_weight
         self.sub_oracle_weight = sub_oracle_weight
         self.sub_agreement_weight = sub_agreement_weight
+        self.structured_sub = structured_sub
         self.save_dir = Path(config.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.model = None
 
-    def generate_action(self, adapter_name: str, prompt: str) -> str:
+    def generate_action(self, adapter_name: str, prompt: str, structured: bool = False) -> str:
         text = self.model.generate_one(
             adapter_name,
             prompt,
             max_tokens=self.config.max_response_len,
             response_prefix="",
-            canonicalizer=first_line,
+            canonicalizer=truncate_structured_sub if structured else first_line,
         )
         return text
 
     def build_sub_prompt(self, observation: str, history) -> str:
         return build_prompt(
             self.model.tokenizer,
-            SUB_SYSTEM,
+            STRUCTURED_SUB_SYSTEM if self.structured_sub else SUB_SYSTEM,
             f"Current observation:\n{observation}\n\nHistory:\n{history_text(history)}",
         )
 
@@ -139,15 +156,16 @@ class PlancraftMASGRPOTrainer:
         for _step in range(self.max_steps):
             oracle_action = self.oracle_next_action(episode)
             sub_prompt = self.build_sub_prompt(observation, history)
-            sub_raw = self.generate_action(SharedModel.SUB_ADAPTER, sub_prompt)
+            sub_raw = self.generate_action(SharedModel.SUB_ADAPTER, sub_prompt, structured=self.structured_sub)
             main_prompt = self.build_main_prompt(observation, history, sub_raw)
             main_raw = self.generate_action(SharedModel.MAIN_ADAPTER, main_prompt)
-            sub_norm = normalize_action(sub_raw)
+            sub_action = extract_structured_action(sub_raw) if self.structured_sub else sub_raw
+            sub_norm = normalize_action(sub_action)
             main_norm = normalize_action(main_raw)
             oracle_norm = normalize_action(oracle_action)
             step_scores.append(
                 {
-                    "sub_valid": 1.0 if self.action_is_valid(episode, sub_raw) else 0.0,
+                    "sub_valid": 1.0 if self.action_is_valid(episode, sub_action) else 0.0,
                     "main_valid": 1.0 if self.action_is_valid(episode, main_raw) else 0.0,
                     "sub_oracle_match": 1.0 if sub_norm and sub_norm == oracle_norm else 0.0,
                     "main_oracle_match": 1.0 if main_norm and main_norm == oracle_norm else 0.0,
@@ -295,7 +313,7 @@ class PlancraftMASGRPOTrainer:
             f"sub=(global:{self.sub_global_weight}, valid:{self.sub_valid_weight}, "
             f"oracle:{self.sub_oracle_weight}, agree:{self.sub_agreement_weight})"
         )
-        print(f"[plancraft-mas-grpo] eval_samples={self.eval_samples}")
+        print(f"[plancraft-mas-grpo] eval_samples={self.eval_samples} structured_sub={self.structured_sub}")
         self.model = SharedModel(self.config.base_model, self.config)
         self.model.load_sft_weights()
         self.model.model.train()
@@ -384,6 +402,7 @@ def parse_args():
     parser.add_argument("--sub-valid-weight", type=float, default=0.3)
     parser.add_argument("--sub-oracle-weight", type=float, default=0.5)
     parser.add_argument("--sub-agreement-weight", type=float, default=0.2)
+    parser.add_argument("--structured-sub", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--seed", type=int, default=123)
     return parser.parse_args()
 
@@ -421,6 +440,7 @@ def main():
         sub_valid_weight=args.sub_valid_weight,
         sub_oracle_weight=args.sub_oracle_weight,
         sub_agreement_weight=args.sub_agreement_weight,
+        structured_sub=args.structured_sub,
     ).train(train_examples, val_examples, iterations=args.iterations)
 
 

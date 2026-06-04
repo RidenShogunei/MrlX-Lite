@@ -37,6 +37,7 @@ hotpotqa_dynamic_verifier*_data_*.jsonl
 plancraft_*_sft_data*.jsonl
 plancraft_*_checkpoints*/
 plancraft_mas_sft_*/
+plancraft_mas_structured_sft_*/
 plancraft_mas_grpo_*/
 
 # Evaluation output directories; summaries are captured in reports

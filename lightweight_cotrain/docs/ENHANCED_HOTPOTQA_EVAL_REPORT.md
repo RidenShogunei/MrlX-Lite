@@ -1740,3 +1740,156 @@ progress:
   - penalize repeated no-op moves,
   - reward Sub advice that would improve state even if Main does not copy it.
 ```
+
+## Structured Sub Interface
+
+Changed:
+```text
+generate_plancraft_mas_sft_data.py
+analyze_plancraft_mas_results.py
+grpo_plancraft_mas.py
+```
+
+Motivation:
+```text
+The previous Sub interface asked Sub to output exactly the next low-level action.
+That made Sub collapse into an action mirror of Main.
+
+The new structured interface gives Sub a separate communication role:
+  <subgoal>...</subgoal>
+  <reason>...</reason>
+  <action>...</action>
+
+Main still outputs only one executable Plancraft action.
+```
+
+SFT data:
+```text
+python generate_plancraft_mas_sft_data.py ^
+  --split train ^
+  --limit 50 ^
+  --max-steps 30 ^
+  --structured-sub ^
+  --output .\plancraft_mas_structured_sft_data_50.jsonl
+```
+
+Generated:
+```text
+634 samples
+main = 317
+sub = 317
+```
+
+Training:
+```text
+base_model = Qwen2.5-1.5B-Instruct local
+init main = plancraft_mas_sft_50x1/main_agent
+init sub  = plancraft_mas_sft_50x1/sub_agent
+data      = plancraft_mas_structured_sft_data_50.jsonl
+epochs    = 1
+lr        = 1e-4
+max_len   = 2048
+save_dir  = plancraft_mas_structured_sft_50x1
+```
+
+Training result:
+```text
+Main prepared samples = 271 / 317
+Main loss = 0.0000
+Sub prepared samples = 273 / 317
+Sub loss = 0.1997
+```
+
+Structured SFT easy5 evaluation:
+```text
+split = val.small.easy
+tasks = 5
+max_steps = 10
+max_tokens = 120
+structured_sub = true
+```
+
+Result:
+```text
+success_rate = 0.200
+reward = 0.200
+avg_steps = 8.400
+invalid_action_rate = 0.040
+```
+
+Comparison:
+```text
+Old action-only Plancraft SFT50 easy5:
+  success_rate = 0.400
+  invalid_action_rate = 0.280
+
+Structured Plancraft SFT50 easy5:
+  success_rate = 0.200
+  invalid_action_rate = 0.040
+```
+
+Interpretation:
+```text
+The structured interface greatly improves action validity, but reduces solved
+tasks on this tiny easy5 slice. Main can parse structured advice, but the new
+interface likely needs more SFT data before it matches the old action-only
+policy's success rate.
+```
+
+Structured M-GRPO-style run:
+```text
+init = plancraft_mas_structured_sft_50x1
+train = 5
+val = 5
+iterations = 1
+group_size = 2
+max_steps = 8
+max_response_len = 120
+eval_samples = 2
+lr = 1e-7
+structured_sub = true
+save_dir = plancraft_mas_grpo_structured_mgrpo_5x1
+```
+
+Trainer result:
+```text
+val:init success = 0.000
+val:init valid_rate = 0.973
+val:init main_oracle = 0.058
+val:init sub_oracle = 0.058
+
+train success = 0.400
+train valid_rate = 1.000
+train main_oracle = 0.250
+train sub_oracle = 0.250
+updates main/sub = 48 / 48
+
+val success = 0.200
+val valid_rate = 0.963
+val main_oracle = 0.163
+val sub_oracle = 0.163
+best checkpoint saved
+```
+
+Unified evaluator on structured GRPO best:
+```text
+success_rate = 0.200
+reward = 0.200
+avg_steps = 8.400
+invalid_action_rate = 0.060
+```
+
+Interpretation:
+```text
+This is the first setting where structured M-GRPO improves over its own sampled
+initial validation inside the trainer and saves a new best checkpoint.
+
+But under the deterministic external evaluator, structured GRPO best is still
+tied with structured SFT50 and below old action-only SFT50. The structured
+interface is promising for validity and credit assignment, but it is not yet
+strong enough on success.
+
+The next practical step is not another 5x1 GRPO run. It is to scale structured
+SFT data first, because Main/Sub need more exposure to the new communication
+protocol before RL can reliably improve it.
+```
