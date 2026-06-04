@@ -1893,3 +1893,166 @@ The next practical step is not another 5x1 GRPO run. It is to scale structured
 SFT data first, because Main/Sub need more exposure to the new communication
 protocol before RL can reliably improve it.
 ```
+
+## Structured Short-History SFT200
+
+Changed:
+```text
+generate_plancraft_mas_sft_data.py
+```
+
+Added:
+```text
+--history-steps N
+```
+
+Reason:
+```text
+Structured Sub outputs are longer than action-only Sub outputs. With long
+history, SFT samples can be truncated so far that no assistant target tokens
+remain. The generator now keeps only the most recent N history steps, defaulting
+to 3.
+```
+
+Data:
+```text
+python generate_plancraft_mas_sft_data.py ^
+  --split train ^
+  --limit 200 ^
+  --max-steps 30 ^
+  --history-steps 3 ^
+  --structured-sub ^
+  --output .\plancraft_mas_structured_short_sft_data_200.jsonl
+```
+
+Generated:
+```text
+2860 samples
+main = 1430
+sub = 1430
+```
+
+Prepared-sample check:
+```text
+max_length = 1536 -> main 1383 / 1430, sub 1387 / 1430
+max_length = 2048 -> main 1430 / 1430, sub 1430 / 1430
+max_length = 3072 -> main 1430 / 1430, sub 1430 / 1430
+```
+
+Training:
+```text
+base_model = Qwen2.5-1.5B-Instruct local
+init main = plancraft_mas_structured_sft_50x1/main_agent
+init sub  = plancraft_mas_structured_sft_50x1/sub_agent
+data      = plancraft_mas_structured_short_sft_data_200.jsonl
+epochs    = 1
+lr        = 8e-5
+max_len   = 2048
+save_dir  = plancraft_mas_structured_short_sft_200x1
+```
+
+Training result:
+```text
+Main prepared samples = 1430 / 1430
+Main loss = 0.0000
+Sub prepared samples = 1430 / 1430
+Sub loss = 0.0221
+```
+
+Easy5 evaluation:
+```text
+split = val.small.easy
+tasks = 5
+max_steps = 10
+max_tokens = 120
+structured_sub = true
+```
+
+Result:
+```text
+success_rate = 0.400
+reward = 0.400
+avg_steps = 4.600
+invalid_action_rate = 0.070
+```
+
+Comparison:
+```text
+Old action-only SFT50:
+  success_rate = 0.400
+  avg_steps = 6.800
+  invalid_action_rate = 0.280
+
+Structured SFT50:
+  success_rate = 0.200
+  avg_steps = 8.400
+  invalid_action_rate = 0.040
+
+Structured short-history SFT200:
+  success_rate = 0.400
+  avg_steps = 4.600
+  invalid_action_rate = 0.070
+```
+
+Easy20 evaluation:
+```text
+success_rate = 0.500
+reward = 0.500
+efficiency = 0.212
+avg_steps = 5.050
+invalid_action_rate = 0.077
+```
+
+Interpretation:
+```text
+This is the best Plancraft structured checkpoint so far.
+
+The structured interface has recovered action-only SFT50's easy5 success rate
+while using fewer steps and far fewer invalid actions. On a broader easy20
+slice, it solves half the tasks with low invalid-action rate.
+
+The main fix was not RL; it was giving structured SFT enough data and preserving
+all assistant targets with short history + max_length 2048.
+```
+
+Structured SFT200 -> M-GRPO 5x1:
+```text
+init = plancraft_mas_structured_short_sft_200x1
+train = 5
+val = 5
+iterations = 1
+group_size = 2
+lr = 5e-8
+advantage_clip = 0.5
+eval_samples = 2
+structured_sub = true
+```
+
+Result:
+```text
+val:init success = 0.500
+val:init best_success = 0.600
+val:init valid_rate = 1.000
+val:init main_oracle = 0.487
+val:init sub_oracle = 0.487
+
+train success = 0.600
+train valid_rate = 0.971
+train main_oracle = 0.467
+train sub_oracle = 0.400
+updates main/sub = 29 / 29
+
+val success = 0.400
+val best_success = 0.400
+val valid_rate = 1.000
+val main_oracle = 0.379
+val sub_oracle = 0.379
+```
+
+Interpretation:
+```text
+With a stronger structured SFT base, GRPO still performs real updates but hurts
+held-out validation on this small run. That reinforces the current bottleneck:
+the action-level reward split is not enough. The next GRPO improvement should
+use state-progress reward, not more tiny action-match tuning.
+```

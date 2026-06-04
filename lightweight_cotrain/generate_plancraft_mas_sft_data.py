@@ -41,24 +41,25 @@ MAIN_SYSTEM = (
 )
 
 
-def history_text(history: list[tuple[str, str]]) -> str:
+def history_text(history: list[tuple[str, str]], history_steps: int = 3) -> str:
     if not history:
         return "No actions yet."
     lines = []
-    for idx, (action, observation) in enumerate(history, 1):
+    start_step = max(len(history) - history_steps, 0)
+    for idx, (action, observation) in enumerate(history[start_step:], start_step + 1):
         lines.append(f"Step {idx} action: {action}")
         lines.append(f"Step {idx} observation: {observation}")
-    return "\n".join(lines[-12:])
+    return "\n".join(lines)
 
 
-def sub_user(observation: str, history: list[tuple[str, str]]) -> str:
-    return f"Current observation:\n{observation}\n\nHistory:\n{history_text(history)}"
+def sub_user(observation: str, history: list[tuple[str, str]], history_steps: int = 3) -> str:
+    return f"Current observation:\n{observation}\n\nHistory:\n{history_text(history, history_steps)}"
 
 
-def main_user(observation: str, history: list[tuple[str, str]], sub_advice: str) -> str:
+def main_user(observation: str, history: list[tuple[str, str]], sub_advice: str, history_steps: int = 3) -> str:
     return (
         f"Current observation:\n{observation}\n\n"
-        f"History:\n{history_text(history)}\n\n"
+        f"History:\n{history_text(history, history_steps)}\n\n"
         f"Sub agent advice:\n{sub_advice}"
     )
 
@@ -93,7 +94,7 @@ def make_sample(system: str, user: str, assistant: str, category: str, stage: st
     }
 
 
-def build_samples_for_example(example, max_steps: int, structured_sub: bool = False) -> list[dict]:
+def build_samples_for_example(example, max_steps: int, structured_sub: bool = False, history_steps: int = 3) -> list[dict]:
     episode = PlancraftBenchEpisode(example, max_steps=max_steps)
     observation = episode.reset()
     history: list[tuple[str, str]] = []
@@ -104,15 +105,37 @@ def build_samples_for_example(example, max_steps: int, structured_sub: bool = Fa
     if example.impossible:
         action = "impossible: cannot craft target from the available inventory"
         sub_advice = structured_sub_advice(example, action) if structured_sub else action
-        samples.append(make_sample(sub_system, sub_user(observation, history), sub_advice, "sub", sub_stage, example))
-        samples.append(make_sample(MAIN_SYSTEM, main_user(observation, history, sub_advice), action, "main", "plancraft_main_action", example))
+        samples.append(
+            make_sample(sub_system, sub_user(observation, history, history_steps), sub_advice, "sub", sub_stage, example)
+        )
+        samples.append(
+            make_sample(
+                MAIN_SYSTEM,
+                main_user(observation, history, sub_advice, history_steps),
+                action,
+                "main",
+                "plancraft_main_action",
+                example,
+            )
+        )
         return samples
 
     actions = [action for subplan in episode.oracle_subplans() for action in subplan]
     for action in actions[:max_steps]:
         sub_advice = structured_sub_advice(example, action) if structured_sub else action
-        samples.append(make_sample(sub_system, sub_user(observation, history), sub_advice, "sub", sub_stage, example))
-        samples.append(make_sample(MAIN_SYSTEM, main_user(observation, history, sub_advice), action, "main", "plancraft_main_action", example))
+        samples.append(
+            make_sample(sub_system, sub_user(observation, history, history_steps), sub_advice, "sub", sub_stage, example)
+        )
+        samples.append(
+            make_sample(
+                MAIN_SYSTEM,
+                main_user(observation, history, sub_advice, history_steps),
+                action,
+                "main",
+                "plancraft_main_action",
+                example,
+            )
+        )
         observation, _reward, terminated, truncated, _info = episode.step(action)
         history.append((action, observation))
         if terminated or truncated:
@@ -127,6 +150,7 @@ def parse_args():
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument("--max-steps", type=int, default=30)
+    parser.add_argument("--history-steps", type=int, default=3)
     parser.add_argument("--include-impossible", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--structured-sub", action=argparse.BooleanOptionalAction, default=False)
     return parser.parse_args()
@@ -141,7 +165,14 @@ def main():
         if example.impossible and not args.include_impossible:
             skipped_impossible += 1
             continue
-        samples.extend(build_samples_for_example(example, args.max_steps, structured_sub=args.structured_sub))
+        samples.extend(
+            build_samples_for_example(
+                example,
+                args.max_steps,
+                structured_sub=args.structured_sub,
+                history_steps=args.history_steps,
+            )
+        )
 
     out = Path(args.output)
     with open(out, "w", encoding="utf-8") as f:
@@ -152,6 +183,7 @@ def main():
     print(f"[plancraft-mas-sft] main={sum(1 for s in samples if s['category'] == 'main')}")
     print(f"[plancraft-mas-sft] sub={sum(1 for s in samples if s['category'] == 'sub')}")
     print(f"[plancraft-mas-sft] structured_sub={args.structured_sub}")
+    print(f"[plancraft-mas-sft] history_steps={args.history_steps}")
     print(f"[plancraft-mas-sft] skipped_impossible={skipped_impossible}")
 
 
