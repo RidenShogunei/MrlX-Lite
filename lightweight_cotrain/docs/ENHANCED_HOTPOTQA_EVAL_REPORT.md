@@ -1503,3 +1503,112 @@ Remaining failures are mostly:
 The next useful step is to improve data/windowing and train a larger
 Plancraft-specific SFT checkpoint before any RL comparison.
 ```
+
+## Plancraft Advantage GRPO Baseline
+
+Added:
+```text
+grpo_plancraft_mas.py
+```
+
+This is the first Plancraft-specific GRPO script, separated from the older math
+and HotpotQA training loops.
+
+Training structure:
+```text
+shared Qwen base model
+main LoRA adapter initialized from plancraft_mas_sft_50x1/main_agent
+sub LoRA adapter initialized from plancraft_mas_sft_50x1/sub_agent
+```
+
+Rollout:
+```text
+Sub observes Plancraft state + history -> action advice
+Main observes Plancraft state + history + Sub advice -> executable action
+Environment executes Main action
+Episode reward = success + valid_action bonus - step penalty
+Group-relative normalized advantage is applied to both adapters
+```
+
+Validation:
+```text
+The script saves:
+  save_dir/best/main
+  save_dir/best/sub
+
+Best checkpoint is selected by validation best_success_rate by default.
+The evaluator can now use --eval-samples N, reporting both average and
+best-of-N validation scores to reduce single-rollout noise.
+```
+
+Smoke check:
+```text
+train = 1
+val = 1
+iterations = 1
+group_size = 2
+max_steps = 3
+eval_samples = 2
+lr = 1e-7
+```
+
+Result:
+```text
+val:init success = 1.000
+train success = 0.000
+updates main/sub = 0 / 0
+val success = 0.500
+val best_success = 1.000
+```
+
+Interpretation:
+```text
+The training loop and checkpoint saving work. On a one-task smoke, both group
+samples can receive the same reward, giving zero normalized advantage and no
+update. This is expected for too-small groups/tasks and is not enough to judge
+GRPO quality.
+```
+
+Small GRPO run:
+```text
+train = 5
+val = 5
+iterations = 1
+group_size = 2
+max_steps = 8
+eval_samples = 2
+lr = 1e-7
+save_dir = plancraft_mas_grpo_adv_5x1
+```
+
+Result:
+```text
+val:init success = 0.400
+val:init best_success = 0.400
+
+train success = 0.200
+train reward = 0.297
+train valid_rate = 0.825
+updates main/sub = 10 / 10
+
+val success = 0.200
+val best_success = 0.200
+val valid_rate = 0.912
+```
+
+Interpretation:
+```text
+The corrected GRPO loop can now produce real Main/Sub updates, so we finally
+have a meaningful SFT-vs-GRPO comparison path.
+
+However, the first small GRPO update made held-out validation worse. The current
+best checkpoint therefore remains the initialization checkpoint copied from
+Plancraft SFT50, while the updated adapters are saved separately as step_1.
+
+This suggests the immediate bottleneck is not just "can we run RL"; it is
+rollout/reward stability. With only group_size=2 and sparse success reward, the
+advantage signal is high variance. The next improvement should be either:
+  - larger group_size / more validation samples,
+  - denser trajectory-level reward for subgoal progress,
+  - or a stronger Plancraft SFT base before RL.
+```
