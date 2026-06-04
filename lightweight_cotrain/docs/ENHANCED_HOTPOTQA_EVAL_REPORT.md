@@ -993,3 +993,101 @@ to treat as a solved starting point for joint GRPO.
 The next RL step should still be Main-only if we proceed, with Sub frozen.
 Before that, inspect offset 40 failures and improve synthesis robustness.
 ```
+
+## Offset-40 Failure Trace And Sub Evidence Replay
+
+Added diagnostic tooling:
+```text
+analyze_hotpotqa_dynamic_failures.py
+generate_hotpotqa_dynamic_sub_evidence_sft_data.py
+```
+
+The failure tracer separates:
+```text
+plan_support_recall
+read_support_recall
+sub_summary_evidence_recall
+sub_summary_answer_f1
+final_answer_f1
+final_evidence
+final_reward
+duplicate_reads
+```
+
+Offset 40 trace for synthesis 500x1 with the original dynamic mixture Sub:
+| metric | value |
+|---|---:|
+| plan_support_recall | 0.550 |
+| read_support_recall | 0.700 |
+| sub_summary_evidence_recall | 0.650 |
+| sub_summary_answer_f1 | 0.388 |
+| final_answer_f1 | 0.475 |
+| final_evidence | 0.700 |
+| final_reward | 0.573 |
+| duplicate_reads | 0.000 |
+
+Main finding:
+```text
+The hard failures are not pure retrieval failures.
+Several examples read both gold documents but still choose the wrong comparative/multi-hop answer.
+This points to local Sub answer guessing and final Main synthesis as the main bottlenecks.
+```
+
+Tried Sub-only evidence-summary continuation:
+```text
+checkpoint = hotpotqa_dynamic_sub_evidence_500x1/sub_agent
+base Sub   = hotpotqa_dynamic_mixture_sft_300x1_v3/sub_agent
+data       = 500 tasks, 1000 Sub evidence-summary samples
+lr         = 3e-5
+epochs     = 1
+```
+
+Result on offset 40:
+```text
+answer_f1 = 0.046
+evidence  = 0.625
+reward    = 0.257
+```
+
+Interpretation:
+```text
+Pure Sub evidence-summary SFT causes catastrophic forgetting.
+The Sub starts sounding like a summarizer but loses the action/read/answer behavior needed by the current dynamic rollout.
+```
+
+Then added action replay into the Sub evidence data:
+```text
+checkpoint = hotpotqa_dynamic_sub_evidence_replay_500x1/sub_agent
+data       = 4500 Sub samples
+contents   = fixed Sub action replay + focused Sub action replay + evidence-summary samples
+lr         = 2e-5
+epochs     = 1
+```
+
+Same offset 40, samples 2:
+| Sub checkpoint | answer_f1 | evidence | reward | best_answer_f1 | best_reward |
+|---|---:|---:|---:|---:|---:|
+| original dynamic mixture Sub | 0.137 | 0.675 | 0.331 | 0.140 | 0.338 |
+| sub evidence replay 500x1 | 0.205 | 0.650 | 0.374 | 0.303 | 0.442 |
+
+But multi-offset validation shows the replay Sub is not globally better:
+| offset | answer_f1 | evidence | reward | best_answer_f1 | best_reward |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0.012 | 0.725 | 0.254 | 0.022 | 0.260 |
+| 20 | 0.104 | 0.675 | 0.308 | 0.108 | 0.316 |
+| 40 | 0.205 | 0.650 | 0.374 | 0.303 | 0.442 |
+| 60 | 0.010 | 0.750 | 0.257 | 0.012 | 0.275 |
+| 80 | 0.108 | 0.650 | 0.306 | 0.206 | 0.374 |
+| average | 0.088 | 0.690 | 0.300 | 0.130 | 0.333 |
+
+Decision:
+```text
+Do not replace the current Sub with the evidence-replay Sub.
+The replay version partially fixes offset 40, but collapses answer_f1 across other offsets.
+
+The next useful direction is not more Sub-summary SFT in isolation.
+The better path is a verifier/synthesis-style Main objective:
+  - keep the current dynamic mixture Sub frozen;
+  - expose Main to conflicting/partial Sub outputs;
+  - train Main to ground the final answer in evidence, not blindly copy a Sub guess.
+```

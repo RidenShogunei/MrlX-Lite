@@ -30,12 +30,15 @@ hotpotqa_dynamic_mas_*sft_*/
 hotpotqa_dynamic_mas_*continued_*/
 hotpotqa_dynamic_mixture_*sft_*/
 hotpotqa_dynamic_synthesis_*mainonly_*/
+hotpotqa_dynamic_sub_evidence_*/
+hotpotqa_dynamic_sub_evidence*_data_*.jsonl
 
 # Evaluation output directories; summaries are captured in reports
 hotpotqa_*_eval_*/
 hotpotqa_eval_suite*/
 hotpotqa_main_oracle*/
 hotpotqa_direct_eval*/
+hotpotqa_dynamic_failure_trace*/
 
 # Smoke/test generated data
 *_smoke/

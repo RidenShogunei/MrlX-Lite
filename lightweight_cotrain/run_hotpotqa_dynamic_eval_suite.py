@@ -21,6 +21,11 @@ DYNAMIC_MODELS = [
         "main_lora": "./hotpotqa_dynamic_synthesis_mainonly_500x1/main_agent",
         "sub_lora": "./hotpotqa_dynamic_mixture_sft_300x1_v3/sub_agent",
     },
+    {
+        "name": "dynamic_synthesis_subevidence_replay_500x1",
+        "main_lora": "./hotpotqa_dynamic_synthesis_mainonly_500x1/main_agent",
+        "sub_lora": "./hotpotqa_dynamic_sub_evidence_replay_500x1/sub_agent",
+    },
 ]
 
 
