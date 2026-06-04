@@ -24,6 +24,9 @@ class HotpotMASGRPOTrainer:
         train_main: bool = True,
         train_sub: bool = True,
         sub_reward_mode: str = "summary",
+        objective: str = "best_of",
+        advantage_clip: float = 2.0,
+        min_advantage: float = 0.0,
     ):
         self.config = config
         self.sub_steps = sub_steps
@@ -31,6 +34,9 @@ class HotpotMASGRPOTrainer:
         self.train_main = train_main
         self.train_sub = train_sub
         self.sub_reward_mode = sub_reward_mode
+        self.objective = objective
+        self.advantage_clip = advantage_clip
+        self.min_advantage = min_advantage
         self.save_dir = Path(config.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.model = None
@@ -277,6 +283,54 @@ class HotpotMASGRPOTrainer:
         candidates.sort(key=self.candidate_key, reverse=True)
         return candidates[0]
 
+    @staticmethod
+    def group_advantages(candidates, reward_key: str, clip: float):
+        values = [cand[reward_key] for cand in candidates]
+        mean = sum(values) / max(len(values), 1)
+        var = sum((value - mean) ** 2 for value in values) / max(len(values), 1)
+        std = max(var ** 0.5, 1e-6)
+        for cand, value in zip(candidates, values):
+            adv = (value - mean) / std
+            cand[f"{reward_key}_advantage"] = max(min(adv, clip), -clip)
+        return candidates
+
+    def run_group(self, task: HotpotTask):
+        candidates = [self.generate_candidate(task) for _ in range(self.config.group_size)]
+        candidates = self.group_advantages(candidates, "reward", self.advantage_clip)
+        candidates = self.group_advantages(candidates, "sub_train_reward", self.advantage_clip)
+        candidates.sort(key=self.candidate_key, reverse=True)
+        return candidates
+
+    def apply_best_of_update(self, best):
+        main_updates, sub_updates = 0, 0
+        if self.train_main and best["reward"] >= self.config.reward_threshold:
+            self.model.sft_step(SharedModel.MAIN_ADAPTER, best["plan_prompt"], best["plan_raw"], weight=best["reward"])
+            self.model.sft_step(SharedModel.MAIN_ADAPTER, best["answer_prompt"], best["answer_raw"], weight=best["reward"])
+            main_updates += 1
+
+        if self.train_sub and best["sub_train_reward"] >= self.config.reward_threshold:
+            for prompt, action, _ok, _observation in best["sub_action_steps"]:
+                self.model.sft_step(SharedModel.SUB_ADAPTER, prompt, action, weight=best["sub_train_reward"])
+            self.model.sft_step(SharedModel.SUB_ADAPTER, best["sub_summary_prompt"], best["sub_summary"], weight=best["sub_train_reward"])
+            sub_updates += 1
+        return main_updates, sub_updates
+
+    def apply_advantage_update(self, candidates):
+        main_updates, sub_updates = 0, 0
+        for cand in candidates:
+            main_adv = cand["reward_advantage"]
+            sub_adv = cand["sub_train_reward_advantage"]
+            if self.train_main and abs(main_adv) >= self.min_advantage:
+                self.model.sft_step(SharedModel.MAIN_ADAPTER, cand["plan_prompt"], cand["plan_raw"], weight=main_adv)
+                self.model.sft_step(SharedModel.MAIN_ADAPTER, cand["answer_prompt"], cand["answer_raw"], weight=main_adv)
+                main_updates += 1
+            if self.train_sub and abs(sub_adv) >= self.min_advantage:
+                for prompt, action, _ok, _observation in cand["sub_action_steps"]:
+                    self.model.sft_step(SharedModel.SUB_ADAPTER, prompt, action, weight=sub_adv)
+                self.model.sft_step(SharedModel.SUB_ADAPTER, cand["sub_summary_prompt"], cand["sub_summary"], weight=sub_adv)
+                sub_updates += 1
+        return main_updates, sub_updates
+
     def evaluate(self, tasks: List[HotpotTask], samples: int = 1):
         if not tasks:
             return {
@@ -343,7 +397,8 @@ class HotpotMASGRPOTrainer:
         print(f"[hotpotqa-mas-grpo] lr={self.config.lr} group={self.config.group_size} threshold={self.config.reward_threshold}")
         print(
             f"[hotpotqa-mas-grpo] train_main={self.train_main} train_sub={self.train_sub} "
-            f"best_metric={self.best_metric} sub_reward_mode={self.sub_reward_mode}"
+            f"best_metric={self.best_metric} sub_reward_mode={self.sub_reward_mode} "
+            f"objective={self.objective} advantage_clip={self.advantage_clip} min_advantage={self.min_advantage}"
         )
 
         self.model = SharedModel(self.config.base_model, self.config)
@@ -371,7 +426,12 @@ class HotpotMASGRPOTrainer:
             sub_rewards, sub_train_rewards, sub_retrievals, sub_precisions = [], [], [], []
             main_updates, sub_updates = 0, 0
             for task in train_tasks:
-                best = self.run_episode(task)
+                if self.objective == "advantage":
+                    candidates = self.run_group(task)
+                    best = candidates[0]
+                else:
+                    candidates = None
+                    best = self.run_episode(task)
                 rewards.append(best["reward"])
                 answers.append(best["answer_f1"])
                 evidences.append(best["evidence"])
@@ -381,16 +441,12 @@ class HotpotMASGRPOTrainer:
                 sub_retrievals.append(best["sub_retrieval_reward"])
                 sub_precisions.append(best["sub_read_precision"])
 
-                if self.train_main and best["reward"] >= self.config.reward_threshold:
-                    self.model.sft_step(SharedModel.MAIN_ADAPTER, best["plan_prompt"], best["plan_raw"], weight=best["reward"])
-                    self.model.sft_step(SharedModel.MAIN_ADAPTER, best["answer_prompt"], best["answer_raw"], weight=best["reward"])
-                    main_updates += 1
-
-                if self.train_sub and best["sub_train_reward"] >= self.config.reward_threshold:
-                    for prompt, action, _ok, _observation in best["sub_action_steps"]:
-                        self.model.sft_step(SharedModel.SUB_ADAPTER, prompt, action, weight=best["sub_train_reward"])
-                    self.model.sft_step(SharedModel.SUB_ADAPTER, best["sub_summary_prompt"], best["sub_summary"], weight=best["sub_train_reward"])
-                    sub_updates += 1
+                if self.objective == "advantage":
+                    group_main_updates, group_sub_updates = self.apply_advantage_update(candidates)
+                else:
+                    group_main_updates, group_sub_updates = self.apply_best_of_update(best)
+                main_updates += group_main_updates
+                sub_updates += group_sub_updates
 
             print(
                 f"  train reward={sum(rewards)/max(len(rewards),1):.3f} "
@@ -459,6 +515,9 @@ def parse_args():
         default="answer_f1",
     )
     parser.add_argument("--sub-reward-mode", choices=["summary", "retrieval", "mixed", "enhanced"], default="summary")
+    parser.add_argument("--objective", choices=["best_of", "advantage"], default="best_of")
+    parser.add_argument("--advantage-clip", type=float, default=2.0)
+    parser.add_argument("--min-advantage", type=float, default=0.0)
     parser.add_argument("--train-main", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--train-sub", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
@@ -486,6 +545,9 @@ def main():
         train_main=args.train_main,
         train_sub=args.train_sub,
         sub_reward_mode=args.sub_reward_mode,
+        objective=args.objective,
+        advantage_clip=args.advantage_clip,
+        min_advantage=args.min_advantage,
     ).train(
         train_env.tasks, val_env.tasks, iterations=args.iterations, eval_samples=args.eval_samples
     )

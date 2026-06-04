@@ -1160,3 +1160,98 @@ some samples are better, some are worse.
 The next step should use verifier as a selection/reranking signal or distill best-of outputs,
 not simply replace the deployed Main checkpoint.
 ```
+
+## Advantage-Based MAS GRPO Patch
+
+Problem found:
+```text
+The older grpo_hotpotqa.py and grpo_hotpotqa_mas.py scripts imported grpo_v4.py,
+but grpo_v4.py was no longer present after project cleanup.
+
+More importantly, the MAS "GRPO" loop was actually winner-only reward-filtered SFT:
+  sample group candidates
+  choose the best candidate
+  SFT-update only that candidate
+```
+
+Implemented:
+```text
+grpo_v4.py
+grpo_hotpotqa_mas.py --objective {best_of, advantage}
+```
+
+The new `advantage` objective computes group-relative advantages:
+```text
+main_advantage = normalize(candidate.final_reward within same task group)
+sub_advantage  = normalize(candidate.sub_train_reward within same task group)
+```
+
+Then it updates all group candidates:
+```text
+positive advantage -> increase log-prob of that trajectory
+negative advantage -> decrease log-prob of that trajectory
+```
+
+This is still not full paper-level M-GRPO:
+```text
+no old-policy ratio
+no PPO/GRPO clipping on probability ratio
+no explicit KL penalty
+no per-turn critic
+```
+
+But it fixes the most important flaw in the previous lightweight trainer:
+```text
+bad samples are no longer silently discarded;
+the group now provides relative positive and negative learning signals.
+```
+
+Smoke command:
+```bash
+python grpo_hotpotqa_mas.py ^
+  --base-model .\models\qwen\Qwen2___5-1___5B-Instruct ^
+  --train-jsonl .\hotpotqa_data_enhanced\train.jsonl ^
+  --val-jsonl .\hotpotqa_data_enhanced\val.jsonl ^
+  --tasks 1 ^
+  --val-tasks 1 ^
+  --iterations 1 ^
+  --group-size 2 ^
+  --eval-samples 1 ^
+  --main-lora .\hotpotqa_mas_enhanced_mainonly_conservative_50x1\best\main ^
+  --sub-lora .\hotpotqa_mas_enhanced_mainonly_conservative_50x1\best\sub ^
+  --save-dir .\hotpotqa_mas_advantage_smoke ^
+  --max-response-len 80 ^
+  --sub-steps 1 ^
+  --lr 1e-7 ^
+  --reward-threshold 0.45 ^
+  --best-metric reward ^
+  --sub-reward-mode enhanced ^
+  --objective advantage ^
+  --advantage-clip 1.0 ^
+  --min-advantage 0.01 ^
+  --train-main ^
+  --train-sub
+```
+
+Smoke result:
+```text
+init val reward = 0.200
+iter train reward = 0.300
+updates main = 2
+updates sub = 2
+final val reward = 0.200
+status = runs end-to-end
+```
+
+Decision:
+```text
+This patch restores the lightweight MAS RL script and makes the update closer to
+real group-relative optimization.
+
+The next real experiment should compare:
+  1. old best_of objective
+  2. new advantage objective
+
+Use the same staged-best fixed MAS checkpoint, small LR, held-out validation,
+and keep checkpoints selected only by validation metrics.
+```
