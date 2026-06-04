@@ -41,6 +41,7 @@ hotpotqa_eval_suite*/
 hotpotqa_main_oracle*/
 hotpotqa_direct_eval*/
 hotpotqa_dynamic_failure_trace*/
+plancraft_eval_*/
 
 # Smoke/test generated data
 *_smoke/

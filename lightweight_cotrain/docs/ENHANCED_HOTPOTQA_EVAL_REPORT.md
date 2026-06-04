@@ -1255,3 +1255,122 @@ The next real experiment should compare:
 Use the same staged-best fixed MAS checkpoint, small LR, held-out validation,
 and keep checkpoints selected only by validation metrics.
 ```
+
+## Plancraft Bench Integration
+
+Motivation:
+```text
+HotpotQA is useful for controlled evidence/reasoning diagnostics, but fixed MAS
+is naturally strong there because most tasks need a small fixed number of support
+documents.
+
+Plancraft is a better intermediate benchmark for planning/tool-use/delegation:
+  - deterministic environment
+  - clear success reward
+  - text-only interface
+  - variable crafting complexity
+  - official oracle planner/subplans
+```
+
+Implemented:
+```text
+plancraft_environment.py
+analyze_plancraft_results.py
+patch_plancraft_windows.py
+requirements.txt += plancraft
+```
+
+Windows compatibility:
+```text
+Plancraft 0.4.9 has a Windows import bug in environment/recipes.py:
+  tag_file.split("/") does not strip backslash paths
+
+On Windows this can fail with:
+  KeyError: 'acacia_logs'
+
+Run once:
+  python patch_plancraft_windows.py
+```
+
+Current wrapper:
+```text
+PlancraftBenchEpisode:
+  reset()
+  oracle_subplans()
+  step(action)
+  result()
+
+Evaluator policies:
+  oracle      = execute Plancraft's official oracle subplans
+  impossible  = always emit the impossible action
+```
+
+MAS evaluator:
+```text
+analyze_plancraft_mas_results.py
+
+Each Plancraft step:
+  Sub receives current objective/inventory/history and suggests one low-level action.
+  Main receives the same state plus Sub advice and outputs one executable action.
+  Env executes the Main action and records success/validity/steps.
+```
+
+Smoke checks:
+```bash
+python analyze_plancraft_results.py ^
+  --split val.small.easy ^
+  --tasks 5 ^
+  --policy oracle ^
+  --out-dir .\plancraft_eval_oracle_smoke
+```
+
+Result:
+```text
+tasks = 5
+success_rate = 1.000
+reward = 1.000
+avg_steps = 2.000
+invalid_action_rate = 0.000
+```
+
+Larger oracle sanity check:
+```bash
+python analyze_plancraft_results.py ^
+  --split val.small ^
+  --tasks 20 ^
+  --policy oracle ^
+  --out-dir .\plancraft_eval_oracle_20
+```
+
+Result:
+```text
+tasks = 20
+success_rate = 1.000
+reward = 1.000
+avg_steps = 2.250
+invalid_action_rate = 0.000
+```
+
+Interpretation:
+```text
+Plancraft is now connected as a benchmark and the official oracle path can
+drive the environment to success.
+
+Zero-shot MAS smoke using the current HotpotQA fixed MAS checkpoint:
+  tasks = 1
+  success_rate = 0.000
+  invalid_action_rate = 1.000
+
+This is expected: the HotpotQA LoRA has never been trained on Plancraft slot/action
+syntax, so it cannot be used as a meaningful Plancraft policy yet.
+
+The next step is Plancraft-specific SFT before RL:
+  - generate Main/Sub samples from oracle subplans
+  - train action syntax and simple crafting behavior
+  - then compare fixed MAS vs dynamic MAS on:
+  - success_rate
+  - valid_action_rate
+  - avg_steps
+  - impossible accuracy
+  - subplan/delegation usage
+```
