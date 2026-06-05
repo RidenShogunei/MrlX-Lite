@@ -2178,3 +2178,109 @@ selection stability:
 Current best checkpoint remains:
   plancraft_mas_structured_short_sft_200x1
 ```
+
+## Formal Progress-GRPO 20x1 Group-4 Experiment
+
+Changed:
+```text
+grpo_plancraft_mas.py
+```
+
+Added:
+```text
+--reward-gap-threshold
+```
+
+Behavior:
+```text
+For Main and Sub separately:
+  reward_gap = max(group rewards) - min(group rewards)
+
+If reward_gap < threshold:
+  set all advantages for that agent to zero
+  skip its update for that group
+```
+
+This prevents GRPO from amplifying nearly identical candidate rewards into large
+normalized advantages.
+
+Experiment:
+```text
+init = plancraft_mas_structured_short_sft_200x1
+train_tasks = 20
+val_tasks = 20
+iterations = 1
+group_size = 4
+max_steps = 8
+max_response_len = 120
+lr = 3e-8
+advantage_clip = 0.5
+reward_gap_threshold = 0.02
+eval_samples = 2
+structured_sub = true
+save_dir = plancraft_mas_grpo_progress_20x1_g4
+```
+
+Trainer result:
+```text
+val:init success = 0.200
+val:init best_success = 0.300
+val:init progress = 0.420
+
+train success = 0.400
+train valid_rate = 0.972
+train progress = 0.693
+updates main/sub = 407 / 400
+
+val success = 0.150
+val best_success = 0.250
+val progress = 0.458
+```
+
+Because trainer evaluation samples at temperature 0.8 and max_steps 8, its
+absolute scores are not directly comparable to the external evaluator used for
+the SFT200 report. The saved step checkpoint was therefore evaluated with the
+same external protocol:
+
+```text
+split = val.small.easy
+tasks = 20
+max_steps = 10
+max_tokens = 120
+structured_sub = true
+```
+
+Fair comparison:
+```text
+Structured SFT200:
+  success_rate = 0.500
+  efficiency = 0.212
+  avg_steps = 5.050
+  invalid_action_rate = 0.077
+
+Progress-GRPO step_1:
+  success_rate = 0.450
+  efficiency = 0.200
+  avg_steps = 5.250
+  invalid_action_rate = 0.083
+```
+
+Interpretation:
+```text
+Increasing the rollout scale from 5 tasks/group 2 to 20 tasks/group 4 makes the
+GRPO result much closer to the SFT baseline. However, it still does not improve
+held-out success, efficiency, or validity.
+
+The result does not support "RL cannot improve the model." It shows that one
+iteration over 80 sampled training trajectories is still insufficient, and that
+the current per-step optimizer update may be too aggressive: about 400 updates
+were applied from only 20 training tasks.
+
+The next controlled experiment should change update mechanics before simply
+adding iterations:
+  - accumulate candidate losses before optimizer.step(),
+  - average updates per group/episode,
+  - or mix SFT replay with GRPO.
+
+Current selected checkpoint remains the structured SFT200 initialization.
+```

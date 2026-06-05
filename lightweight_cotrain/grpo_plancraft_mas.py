@@ -57,6 +57,7 @@ class PlancraftMASGRPOTrainer:
         sub_progress_weight: float = 0.6,
         sub_agreement_weight: float = 0.2,
         structured_sub: bool = False,
+        reward_gap_threshold: float = 0.02,
     ):
         self.config = config
         self.max_steps = max_steps
@@ -76,6 +77,7 @@ class PlancraftMASGRPOTrainer:
         self.sub_progress_weight = sub_progress_weight
         self.sub_agreement_weight = sub_agreement_weight
         self.structured_sub = structured_sub
+        self.reward_gap_threshold = max(reward_gap_threshold, 0.0)
         self.save_dir = Path(config.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.model = None
@@ -233,6 +235,11 @@ class PlancraftMASGRPOTrainer:
 
     def group_advantages(self, candidates, reward_key: str, advantage_key: str):
         values = [cand[reward_key] for cand in candidates]
+        reward_gap = max(values) - min(values) if values else 0.0
+        if reward_gap < self.reward_gap_threshold:
+            for cand in candidates:
+                cand[advantage_key] = 0.0
+            return candidates
         mean = sum(values) / max(len(values), 1)
         var = sum((value - mean) ** 2 for value in values) / max(len(values), 1)
         std = max(var ** 0.5, 1e-6)
@@ -340,7 +347,10 @@ class PlancraftMASGRPOTrainer:
             f"oracle:{self.sub_oracle_weight}, progress:{self.sub_progress_weight}, "
             f"agree:{self.sub_agreement_weight})"
         )
-        print(f"[plancraft-mas-grpo] eval_samples={self.eval_samples} structured_sub={self.structured_sub}")
+        print(
+            f"[plancraft-mas-grpo] eval_samples={self.eval_samples} "
+            f"structured_sub={self.structured_sub} reward_gap_threshold={self.reward_gap_threshold}"
+        )
         self.model = SharedModel(self.config.base_model, self.config)
         self.model.load_sft_weights()
         self.model.model.train()
@@ -435,6 +445,7 @@ def parse_args():
     parser.add_argument("--sub-progress-weight", type=float, default=0.6)
     parser.add_argument("--sub-agreement-weight", type=float, default=0.2)
     parser.add_argument("--structured-sub", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--reward-gap-threshold", type=float, default=0.02)
     parser.add_argument("--seed", type=int, default=123)
     return parser.parse_args()
 
@@ -475,6 +486,7 @@ def main():
         sub_progress_weight=args.sub_progress_weight,
         sub_agreement_weight=args.sub_agreement_weight,
         structured_sub=args.structured_sub,
+        reward_gap_threshold=args.reward_gap_threshold,
     ).train(train_examples, val_examples, iterations=args.iterations)
 
 
