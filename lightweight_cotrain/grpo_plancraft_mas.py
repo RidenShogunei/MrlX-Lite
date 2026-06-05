@@ -494,6 +494,8 @@ def parse_args():
     parser.add_argument("--save-dir", default="./plancraft_mas_grpo_adv_smoke")
     parser.add_argument("--train-split", default="train")
     parser.add_argument("--val-split", default="val.small.easy")
+    parser.add_argument("--train-offset", type=int, default=0)
+    parser.add_argument("--val-offset", type=int, default=0)
     parser.add_argument("--tasks", type=int, default=10)
     parser.add_argument("--val-tasks", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=1)
@@ -536,8 +538,8 @@ def main():
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    train_examples = load_examples(args.train_split, limit=args.tasks)
-    val_examples = load_examples(args.val_split, limit=args.val_tasks)
+    train_examples = load_examples(args.train_split, offset=args.train_offset, limit=args.tasks)
+    val_examples = load_examples(args.val_split, offset=args.val_offset, limit=args.val_tasks)
     config = CoTrainConfig(
         base_model=args.base_model,
         main_lora_path=args.main_lora,

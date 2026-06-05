@@ -2482,3 +2482,108 @@ The next experiment should train on substantially more RL tasks, rather than
 only evaluate on more tasks. A suitable next scale is 50-100 train tasks,
 group_size 4, with easy100 held out for final evaluation.
 ```
+
+## Independent 50-Task Batch GRPO Training
+
+Changed:
+```text
+grpo_plancraft_mas.py
+```
+
+Added:
+```text
+--train-offset
+--val-offset
+```
+
+The structured SFT200 data was generated from the first 200 train examples.
+This experiment therefore used 50 later examples beginning at train offset 200,
+avoiding direct reuse of the SFT task slice.
+
+Training:
+```text
+init = plancraft_mas_structured_short_sft_200x1
+train_split = train
+train_offset = 200
+train_tasks = 50
+val_tasks = 20
+iterations = 1
+group_size = 4
+sampled training trajectories = 200
+lr = 3e-8
+advantage_clip = 0.5
+reward_gap_threshold = 0.02
+sft_replay_per_group = 1
+sft_replay_weight = 0.1
+group-batched optimizer updates = true
+structured_sub = true
+save_dir = plancraft_mas_grpo_batch_replay_50x1_g4_offset200
+```
+
+Training result:
+```text
+val:init success = 0.200
+val:init best_success = 0.300
+
+train success = 0.220
+train valid_rate = 0.992
+train progress = 0.688
+optimizer steps main/sub = 50 / 50
+
+val success = 0.225
+val best_success = 0.350
+val progress = 0.447
+```
+
+The internal high-temperature validation improved and saved a new best
+checkpoint.
+
+Final external easy100:
+```text
+Structured SFT200:
+  success_rate = 0.400
+  solved = 40 / 100
+  efficiency = 0.182
+  avg_steps = 5.570
+  invalid_action_rate = 0.097
+
+50-task batch GRPO best:
+  success_rate = 0.380
+  solved = 38 / 100
+  efficiency = 0.162
+  avg_steps = 5.850
+  invalid_action_rate = 0.092
+```
+
+Paired analysis:
+```text
+solved by both = 31
+solved by neither = 53
+GRPO-only solves = 7
+SFT-only solves = 9
+success-rate difference = -0.020
+paired bootstrap 95% CI = [-0.100, +0.060]
+exact McNemar p = 0.804
+```
+
+Interpretation:
+```text
+Scaling RL training from 20 to 50 independent tasks does not produce a
+measurable success-rate improvement on easy100.
+
+This rules out the simplest explanation that the negative result was only due
+to using five or twenty RL tasks. The current GRPO reward and trajectory update
+still improve discipline/validity more reliably than task-solving capability.
+
+The internal high-temperature validation selected a checkpoint that did not
+improve the external evaluation. Checkpoint selection and training objective are
+therefore misaligned with the final metric.
+
+Before spending substantially more compute on 100+ tasks or multiple
+iterations, the next priority should be:
+  - deterministic/common-protocol validation during training,
+  - selecting checkpoints by external-style success rather than sampled
+    best-of-N,
+  - and diagnosing the seven gained versus nine lost tasks to find which
+    behaviors the reward promotes or suppresses.
+```
