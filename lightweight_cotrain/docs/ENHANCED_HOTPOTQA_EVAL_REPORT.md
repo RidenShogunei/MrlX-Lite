@@ -2284,3 +2284,136 @@ adding iterations:
 
 Current selected checkpoint remains the structured SFT200 initialization.
 ```
+
+## Group-Batched GRPO with SFT Replay
+
+Changed:
+```text
+grpo_v4.py
+grpo_plancraft_mas.py
+```
+
+Previous update behavior:
+```text
+For every candidate trajectory step:
+  backward
+  clip gradients
+  optimizer.step
+
+The 20-task/group-4 experiment applied about 400 optimizer steps per adapter.
+```
+
+New update behavior:
+```text
+For each rollout group and adapter:
+  collect all eligible trajectory steps
+  normalize rollout weights by the number of collected steps
+  backward all weighted losses
+  optionally backward an averaged SFT replay loss
+  clip gradients once
+  optimizer.step once
+```
+
+New CLI options:
+```text
+--max-train-length
+--sft-replay-path
+--sft-replay-per-group
+--sft-replay-weight
+```
+
+Smoke:
+```text
+train = 1
+val = 1
+group_size = 2
+sft_replay_per_group = 1
+sft_replay_weight = 0.1
+```
+
+Result:
+```text
+replay samples loaded:
+  main = 1430
+  sub = 1430
+
+optimizer steps:
+  main = 1
+  sub = 1
+```
+
+Formal comparison:
+```text
+init = plancraft_mas_structured_short_sft_200x1
+train_tasks = 20
+val_tasks = 20
+iterations = 1
+group_size = 4
+lr = 3e-8
+advantage_clip = 0.5
+reward_gap_threshold = 0.02
+sft_replay_per_group = 1
+sft_replay_weight = 0.1
+max_train_length = 2048
+structured_sub = true
+save_dir = plancraft_mas_grpo_batch_replay_20x1_g4
+```
+
+Trainer result:
+```text
+val:init success = 0.200
+val:init best_success = 0.300
+
+train success = 0.450
+train valid_rate = 0.988
+train progress = 0.742
+optimizer steps main/sub = 20 / 20
+
+val success = 0.125
+val best_success = 0.250
+```
+
+As before, the trainer uses high-temperature rollout sampling, so final
+comparison uses the common external easy20 evaluator.
+
+External easy20:
+```text
+Structured SFT200:
+  success_rate = 0.500
+  efficiency = 0.212
+  avg_steps = 5.050
+  invalid_action_rate = 0.077
+
+Previous progress-GRPO with per-step optimizer updates:
+  success_rate = 0.450
+  efficiency = 0.200
+  avg_steps = 5.250
+  invalid_action_rate = 0.083
+
+Group-batched progress-GRPO + SFT replay:
+  success_rate = 0.550
+  efficiency = 0.225
+  avg_steps = 4.800
+  invalid_action_rate = 0.034
+```
+
+Interpretation:
+```text
+This is the first Plancraft GRPO checkpoint that improves over the structured
+SFT baseline under the same external evaluation protocol.
+
+The result supports the hypothesis that the previous bottleneck was update
+mechanics, not only reward design:
+  - per-step optimizer updates overfit and destabilized the policy,
+  - group-level gradient accumulation made updates much less aggressive,
+  - light SFT replay protected the learned structured communication/action
+    protocol.
+
+The gain is still preliminary: it is +1 solved task on a 20-task slice and one
+random seed. It should be validated on more tasks/seeds before claiming a robust
+RL improvement.
+
+Current experimental best checkpoint:
+  plancraft_mas_grpo_batch_replay_20x1_g4/main_step_1
+  plancraft_mas_grpo_batch_replay_20x1_g4/sub_step_1
+```

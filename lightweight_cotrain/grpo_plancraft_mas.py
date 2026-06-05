@@ -1,6 +1,7 @@
 """Advantage-style GRPO for Plancraft Main/Sub agents."""
 
 import argparse
+import json
 import random
 import re
 from pathlib import Path
@@ -58,6 +59,9 @@ class PlancraftMASGRPOTrainer:
         sub_agreement_weight: float = 0.2,
         structured_sub: bool = False,
         reward_gap_threshold: float = 0.02,
+        sft_replay_path: str | None = None,
+        sft_replay_per_group: int = 0,
+        sft_replay_weight: float = 0.1,
     ):
         self.config = config
         self.max_steps = max_steps
@@ -78,6 +82,10 @@ class PlancraftMASGRPOTrainer:
         self.sub_agreement_weight = sub_agreement_weight
         self.structured_sub = structured_sub
         self.reward_gap_threshold = max(reward_gap_threshold, 0.0)
+        self.sft_replay_path = sft_replay_path
+        self.sft_replay_per_group = max(sft_replay_per_group, 0)
+        self.sft_replay_weight = max(sft_replay_weight, 0.0)
+        self.replay_samples = {SharedModel.MAIN_ADAPTER: [], SharedModel.SUB_ADAPTER: []}
         self.save_dir = Path(config.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.model = None
@@ -255,23 +263,86 @@ class PlancraftMASGRPOTrainer:
         candidates.sort(key=lambda cand: (cand["main_reward"], cand["success"], cand["valid_rate"]), reverse=True)
         return candidates
 
+    def load_replay_samples(self):
+        if not self.sft_replay_path or self.sft_replay_per_group <= 0:
+            return
+        with open(self.sft_replay_path, "r", encoding="utf-8") as replay_file:
+            for line in replay_file:
+                item = json.loads(line)
+                messages = item.get("messages", [])
+                if not messages or messages[-1].get("role") != "assistant":
+                    continue
+                category = item.get("category")
+                adapter_name = SharedModel.MAIN_ADAPTER if category == "main" else SharedModel.SUB_ADAPTER
+                prompt = self.model.tokenizer.apply_chat_template(
+                    messages[:-1],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                self.replay_samples[adapter_name].append((prompt, messages[-1]["content"]))
+        print(
+            "[plancraft-mas-grpo] replay samples "
+            f"main={len(self.replay_samples[SharedModel.MAIN_ADAPTER])} "
+            f"sub={len(self.replay_samples[SharedModel.SUB_ADAPTER])}"
+        )
+
+    def replay_batch(self, adapter_name: str):
+        samples = self.replay_samples[adapter_name]
+        if not samples or self.sft_replay_per_group <= 0:
+            return []
+        count = min(self.sft_replay_per_group, len(samples))
+        return random.sample(samples, count)
+
+    def apply_adapter_update(self, adapter_name: str, records, replay_records) -> int:
+        if not records and not replay_records:
+            return 0
+        self.model.optimizer_zero_grad(adapter_name)
+        backward_count = 0
+        rollout_scale = 1.0 / max(len(records), 1)
+        for prompt, response, advantage in records:
+            loss = self.model.sft_backward(
+                adapter_name,
+                prompt,
+                response,
+                weight=advantage * rollout_scale,
+            )
+            backward_count += 1 if loss != 0.0 else 0
+        replay_scale = self.sft_replay_weight / max(len(replay_records), 1)
+        for prompt, response in replay_records:
+            loss = self.model.sft_backward(
+                adapter_name,
+                prompt,
+                response,
+                weight=replay_scale,
+            )
+            backward_count += 1 if loss != 0.0 else 0
+        if backward_count == 0:
+            self.model.optimizer_zero_grad(adapter_name)
+            return 0
+        self.model.optimizer_step(adapter_name)
+        return 1
+
     def apply_advantage_update(self, candidates):
-        main_updates, sub_updates = 0, 0
+        main_records = []
+        sub_records = []
         for cand in candidates:
             main_adv = cand["main_advantage"]
             sub_adv = cand["sub_advantage"]
             for step in cand["steps"]:
                 if abs(sub_adv) >= self.min_advantage:
-                    self.model.sft_step(SharedModel.SUB_ADAPTER, step["sub_prompt"], step["sub_raw"], weight=sub_adv)
-                    sub_updates += 1
+                    sub_records.append((step["sub_prompt"], step["sub_raw"], sub_adv))
                 if abs(main_adv) >= self.min_advantage:
-                    self.model.sft_step(
-                        SharedModel.MAIN_ADAPTER,
-                        step["main_prompt"],
-                        step["main_raw"],
-                        weight=main_adv,
-                    )
-                    main_updates += 1
+                    main_records.append((step["main_prompt"], step["main_raw"], main_adv))
+        sub_updates = self.apply_adapter_update(
+            SharedModel.SUB_ADAPTER,
+            sub_records,
+            self.replay_batch(SharedModel.SUB_ADAPTER),
+        )
+        main_updates = self.apply_adapter_update(
+            SharedModel.MAIN_ADAPTER,
+            main_records,
+            self.replay_batch(SharedModel.MAIN_ADAPTER),
+        )
         return main_updates, sub_updates
 
     @staticmethod
@@ -351,8 +422,13 @@ class PlancraftMASGRPOTrainer:
             f"[plancraft-mas-grpo] eval_samples={self.eval_samples} "
             f"structured_sub={self.structured_sub} reward_gap_threshold={self.reward_gap_threshold}"
         )
+        print(
+            f"[plancraft-mas-grpo] replay_path={self.sft_replay_path} "
+            f"replay_per_group={self.sft_replay_per_group} replay_weight={self.sft_replay_weight}"
+        )
         self.model = SharedModel(self.config.base_model, self.config)
         self.model.load_sft_weights()
+        self.load_replay_samples()
         self.model.model.train()
 
         init = self.evaluate(val_examples)
@@ -423,6 +499,7 @@ def parse_args():
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--group-size", type=int, default=2)
     parser.add_argument("--max-response-len", type=int, default=50)
+    parser.add_argument("--max-train-length", type=int, default=2048)
     parser.add_argument("--max-steps", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument(
@@ -446,6 +523,9 @@ def parse_args():
     parser.add_argument("--sub-agreement-weight", type=float, default=0.2)
     parser.add_argument("--structured-sub", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--reward-gap-threshold", type=float, default=0.02)
+    parser.add_argument("--sft-replay-path", default=None)
+    parser.add_argument("--sft-replay-per-group", type=int, default=0)
+    parser.add_argument("--sft-replay-weight", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=123)
     return parser.parse_args()
 
@@ -465,6 +545,7 @@ def main():
         save_dir=args.save_dir,
         group_size=args.group_size,
         max_response_len=args.max_response_len,
+        max_train_length=args.max_train_length,
         lr=args.lr,
     )
     PlancraftMASGRPOTrainer(
@@ -487,6 +568,9 @@ def main():
         sub_agreement_weight=args.sub_agreement_weight,
         structured_sub=args.structured_sub,
         reward_gap_threshold=args.reward_gap_threshold,
+        sft_replay_path=args.sft_replay_path,
+        sft_replay_per_group=args.sft_replay_per_group,
+        sft_replay_weight=args.sft_replay_weight,
     ).train(train_examples, val_examples, iterations=args.iterations)
 
 

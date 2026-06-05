@@ -122,11 +122,10 @@ class SharedModel:
         self.model.train()
         return canonicalizer(text) if canonicalizer else text
 
-    def sft_step(self, adapter_name: str, prompt: str, response: str, weight: float = 1.0) -> float:
+    def sft_backward(self, adapter_name: str, prompt: str, response: str, weight: float = 1.0) -> float:
         if abs(weight) <= 1e-8:
             return 0.0
         self.set_trainable_adapter(adapter_name)
-        optimizer = self.optimizers[adapter_name]
         text = prompt + response + (self.tokenizer.eos_token or "")
         encoding = self.tokenizer(
             text,
@@ -156,10 +155,24 @@ class SharedModel:
         if not torch.isfinite(loss):
             return 0.0
         loss.backward()
+        return float(loss.detach().cpu())
+
+    def optimizer_zero_grad(self, adapter_name: str):
+        self.optimizers[adapter_name].zero_grad(set_to_none=True)
+
+    def optimizer_step(self, adapter_name: str):
+        self.set_trainable_adapter(adapter_name)
+        optimizer = self.optimizers[adapter_name]
         torch.nn.utils.clip_grad_norm_((p for p in self.model.parameters() if p.requires_grad), 1.0)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-        return float(loss.detach().cpu())
+
+    def sft_step(self, adapter_name: str, prompt: str, response: str, weight: float = 1.0) -> float:
+        self.optimizer_zero_grad(adapter_name)
+        loss = self.sft_backward(adapter_name, prompt, response, weight=weight)
+        if loss != 0.0:
+            self.optimizer_step(adapter_name)
+        return loss
 
     def save_lora(self, adapter_name: str, output_dir: str):
         os.makedirs(output_dir, exist_ok=True)
