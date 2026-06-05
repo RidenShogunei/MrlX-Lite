@@ -2417,3 +2417,68 @@ Current experimental best checkpoint:
   plancraft_mas_grpo_batch_replay_20x1_g4/main_step_1
   plancraft_mas_grpo_batch_replay_20x1_g4/sub_step_1
 ```
+
+## Full Easy100 SFT vs GRPO Validation
+
+To test whether the easy20 improvement was robust, both checkpoints were
+evaluated on the complete 100-task `val.small.easy` split with identical
+settings:
+
+```text
+tasks = 100
+max_steps = 10
+max_tokens = 120
+structured_sub = true
+seed = 123
+```
+
+Results:
+```text
+Structured SFT200:
+  success_rate = 0.400
+  solved = 40 / 100
+  efficiency = 0.182
+  avg_steps = 5.570
+  invalid_action_rate = 0.097
+
+Group-batched GRPO + SFT replay:
+  success_rate = 0.380
+  solved = 38 / 100
+  efficiency = 0.169
+  avg_steps = 5.680
+  invalid_action_rate = 0.078
+```
+
+Paired task analysis:
+```text
+solved by both = 31
+solved by neither = 53
+GRPO-only solves = 7
+SFT-only solves = 9
+success-rate difference = -0.020
+paired bootstrap 95% CI = [-0.100, +0.060]
+exact McNemar p = 0.804
+```
+
+Interpretation:
+```text
+The easy20 +0.05 result does not reproduce on the complete easy100 split.
+Therefore, the current evidence does not prove that GRPO improves task success
+over SFT.
+
+GRPO does consistently improve action validity:
+  invalid_action_rate falls from 0.097 to 0.078.
+
+But that validity improvement does not yet translate into more completed tasks.
+The 100-task result suggests that the current RL update changes which tasks are
+solved rather than improving overall capability: it gains 7 tasks but loses 9.
+
+The correct conclusion is:
+  - batch updates and SFT replay are more stable than per-step updates,
+  - GRPO improves output/action discipline,
+  - success-rate improvement remains unproven.
+
+The next experiment should train on substantially more RL tasks, rather than
+only evaluate on more tasks. A suitable next scale is 50-100 train tasks,
+group_size 4, with easy100 held out for final evaluation.
+```
