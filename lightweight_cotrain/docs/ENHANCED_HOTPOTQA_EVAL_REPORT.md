@@ -2587,3 +2587,102 @@ iterations, the next priority should be:
   - and diagnosing the seven gained versus nine lost tasks to find which
     behaviors the reward promotes or suppresses.
 ```
+
+## Aligned Low-Temperature Validation
+
+Changed:
+```text
+grpo_v4.py
+grpo_plancraft_mas.py
+```
+
+Training rollout and validation generation are now separated:
+```text
+rollout:
+  temperature = 0.8
+  top_p = 0.95
+  max_steps = 8
+
+validation:
+  temperature = 0.2
+  top_p = 0.9
+  repetition_penalty = 1.05
+  max_steps = 10
+  eval_samples = 1
+  fixed eval seed = 123
+  checkpoint metric = success_rate
+```
+
+New CLI options:
+```text
+--rollout-temperature
+--eval-temperature
+--eval-top-p
+--eval-repetition-penalty
+--eval-max-steps
+--eval-seed
+```
+
+Alignment sanity check:
+```text
+checkpoint = structured SFT200
+val.small.easy tasks = 20
+iterations = 0
+```
+
+Result:
+```text
+aligned trainer validation success = 0.550
+```
+
+This is much closer to the external evaluator than the old high-temperature
+trainer result of 0.200.
+
+The independent 50-task GRPO experiment was then repeated with aligned
+checkpoint selection:
+
+```text
+train_offset = 200
+train_tasks = 50
+group_size = 4
+sampled rollouts = 200
+batch updates + SFT replay
+best metric = low-temperature single-sample success_rate
+```
+
+Result:
+```text
+val:init success = 0.550
+
+train success = 0.200
+train valid_rate = 0.997
+train progress = 0.593
+optimizer steps main/sub = 50 / 50
+
+val after RL success = 0.250
+val after RL invalid_rate = 0.073
+val after RL progress = 0.252
+```
+
+Interpretation:
+```text
+Aligned validation fixes checkpoint selection: the degraded RL checkpoint is
+rejected, and best/ remains the SFT200 initialization.
+
+It also exposes the deeper issue more clearly. The current one-iteration GRPO
+update substantially damages low-temperature held-out performance, even though
+training validity remains high.
+
+Therefore:
+  - the previous high-temperature best-of-N selector was indeed misleading,
+  - but checkpoint selection was not the only problem,
+  - the current GRPO objective/update still overfits rollout behavior and hurts
+    generalization.
+
+The next experiment should not increase the number of tasks again with the same
+objective. It should reduce the effective RL update strength, for example:
+  - lower LR by 3-10x,
+  - reduce advantage_clip,
+  - increase SFT replay weight/count,
+  - or update Main only while freezing Sub as a controlled ablation.
+```

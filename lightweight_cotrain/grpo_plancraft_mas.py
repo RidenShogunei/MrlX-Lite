@@ -62,6 +62,12 @@ class PlancraftMASGRPOTrainer:
         sft_replay_path: str | None = None,
         sft_replay_per_group: int = 0,
         sft_replay_weight: float = 0.1,
+        rollout_temperature: float = 0.8,
+        eval_temperature: float = 0.2,
+        eval_top_p: float = 0.9,
+        eval_repetition_penalty: float = 1.05,
+        eval_max_steps: int = 10,
+        eval_seed: int = 123,
     ):
         self.config = config
         self.max_steps = max_steps
@@ -85,18 +91,27 @@ class PlancraftMASGRPOTrainer:
         self.sft_replay_path = sft_replay_path
         self.sft_replay_per_group = max(sft_replay_per_group, 0)
         self.sft_replay_weight = max(sft_replay_weight, 0.0)
+        self.rollout_temperature = rollout_temperature
+        self.eval_temperature = eval_temperature
+        self.eval_top_p = eval_top_p
+        self.eval_repetition_penalty = eval_repetition_penalty
+        self.eval_max_steps = eval_max_steps
+        self.eval_seed = eval_seed
         self.replay_samples = {SharedModel.MAIN_ADAPTER: [], SharedModel.SUB_ADAPTER: []}
         self.save_dir = Path(config.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.model = None
 
-    def generate_action(self, adapter_name: str, prompt: str, structured: bool = False) -> str:
+    def generate_action(self, adapter_name: str, prompt: str, structured: bool = False, evaluation: bool = False) -> str:
         text = self.model.generate_one(
             adapter_name,
             prompt,
             max_tokens=self.config.max_response_len,
             response_prefix="",
             canonicalizer=truncate_structured_sub if structured else first_line,
+            temperature=self.eval_temperature if evaluation else self.rollout_temperature,
+            top_p=self.eval_top_p if evaluation else 0.95,
+            repetition_penalty=self.eval_repetition_penalty if evaluation else 1.0,
         )
         return text
 
@@ -173,19 +188,25 @@ class PlancraftMASGRPOTrainer:
         )
         return main_reward, sub_reward
 
-    def generate_candidate(self, example):
-        episode = PlancraftBenchEpisode(example, max_steps=self.max_steps)
+    def generate_candidate(self, example, evaluation: bool = False):
+        max_steps = self.eval_max_steps if evaluation else self.max_steps
+        episode = PlancraftBenchEpisode(example, max_steps=max_steps)
         observation = episode.reset()
         history = []
         steps = []
         step_scores = []
-        for _step in range(self.max_steps):
+        for _step in range(max_steps):
             oracle_action = self.oracle_next_action(episode)
             oracle_steps_before = self.oracle_remaining_steps(episode)
             sub_prompt = self.build_sub_prompt(observation, history)
-            sub_raw = self.generate_action(SharedModel.SUB_ADAPTER, sub_prompt, structured=self.structured_sub)
+            sub_raw = self.generate_action(
+                SharedModel.SUB_ADAPTER,
+                sub_prompt,
+                structured=self.structured_sub,
+                evaluation=evaluation,
+            )
             main_prompt = self.build_main_prompt(observation, history, sub_raw)
-            main_raw = self.generate_action(SharedModel.MAIN_ADAPTER, main_prompt)
+            main_raw = self.generate_action(SharedModel.MAIN_ADAPTER, main_prompt, evaluation=evaluation)
             sub_action = extract_structured_action(sub_raw) if self.structured_sub else sub_raw
             sub_norm = normalize_action(sub_action)
             main_norm = normalize_action(main_raw)
@@ -351,9 +372,13 @@ class PlancraftMASGRPOTrainer:
 
     def evaluate(self, examples):
         self.model.model.eval()
+        random.seed(self.eval_seed)
+        torch.manual_seed(self.eval_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.eval_seed)
         rows = []
         for example in examples:
-            samples = [self.generate_candidate(example) for _ in range(self.eval_samples)]
+            samples = [self.generate_candidate(example, evaluation=True) for _ in range(self.eval_samples)]
             rows.extend(samples)
         best_rows = {}
         for index, _example in enumerate(examples):
@@ -421,6 +446,11 @@ class PlancraftMASGRPOTrainer:
         print(
             f"[plancraft-mas-grpo] eval_samples={self.eval_samples} "
             f"structured_sub={self.structured_sub} reward_gap_threshold={self.reward_gap_threshold}"
+        )
+        print(
+            f"[plancraft-mas-grpo] rollout_temperature={self.rollout_temperature} "
+            f"eval_temperature={self.eval_temperature} eval_top_p={self.eval_top_p} "
+            f"eval_max_steps={self.eval_max_steps} eval_seed={self.eval_seed}"
         )
         print(
             f"[plancraft-mas-grpo] replay_path={self.sft_replay_path} "
@@ -507,7 +537,7 @@ def parse_args():
     parser.add_argument(
         "--best-metric",
         choices=["success_rate", "best_success_rate", "reward", "best_reward", "valid_rate"],
-        default="best_success_rate",
+        default="success_rate",
     )
     parser.add_argument("--eval-samples", type=int, default=1)
     parser.add_argument("--advantage-clip", type=float, default=2.0)
@@ -528,6 +558,12 @@ def parse_args():
     parser.add_argument("--sft-replay-path", default=None)
     parser.add_argument("--sft-replay-per-group", type=int, default=0)
     parser.add_argument("--sft-replay-weight", type=float, default=0.1)
+    parser.add_argument("--rollout-temperature", type=float, default=0.8)
+    parser.add_argument("--eval-temperature", type=float, default=0.2)
+    parser.add_argument("--eval-top-p", type=float, default=0.9)
+    parser.add_argument("--eval-repetition-penalty", type=float, default=1.05)
+    parser.add_argument("--eval-max-steps", type=int, default=10)
+    parser.add_argument("--eval-seed", type=int, default=123)
     parser.add_argument("--seed", type=int, default=123)
     return parser.parse_args()
 
@@ -573,6 +609,12 @@ def main():
         sft_replay_path=args.sft_replay_path,
         sft_replay_per_group=args.sft_replay_per_group,
         sft_replay_weight=args.sft_replay_weight,
+        rollout_temperature=args.rollout_temperature,
+        eval_temperature=args.eval_temperature,
+        eval_top_p=args.eval_top_p,
+        eval_repetition_penalty=args.eval_repetition_penalty,
+        eval_max_steps=args.eval_max_steps,
+        eval_seed=args.eval_seed,
     ).train(train_examples, val_examples, iterations=args.iterations)
 
 

@@ -102,6 +102,9 @@ class SharedModel:
         max_tokens: int,
         response_prefix: str = "",
         canonicalizer=None,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.0,
     ) -> str:
         self.model.eval()
         self.model.set_adapter(adapter_name)
@@ -112,8 +115,9 @@ class SharedModel:
                 **encoded,
                 max_new_tokens=max_tokens,
                 do_sample=True,
-                temperature=0.8,
-                top_p=0.95,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
