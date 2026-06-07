@@ -68,6 +68,8 @@ class PlancraftMASGRPOTrainer:
         eval_repetition_penalty: float = 1.05,
         eval_max_steps: int = 10,
         eval_seed: int = 123,
+        train_main: bool = True,
+        train_sub: bool = True,
     ):
         self.config = config
         self.max_steps = max_steps
@@ -97,6 +99,8 @@ class PlancraftMASGRPOTrainer:
         self.eval_repetition_penalty = eval_repetition_penalty
         self.eval_max_steps = eval_max_steps
         self.eval_seed = eval_seed
+        self.train_main = train_main
+        self.train_sub = train_sub
         self.replay_samples = {SharedModel.MAIN_ADAPTER: [], SharedModel.SUB_ADAPTER: []}
         self.save_dir = Path(config.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -354,16 +358,20 @@ class PlancraftMASGRPOTrainer:
                     sub_records.append((step["sub_prompt"], step["sub_raw"], sub_adv))
                 if abs(main_adv) >= self.min_advantage:
                     main_records.append((step["main_prompt"], step["main_raw"], main_adv))
-        sub_updates = self.apply_adapter_update(
-            SharedModel.SUB_ADAPTER,
-            sub_records,
-            self.replay_batch(SharedModel.SUB_ADAPTER),
-        )
-        main_updates = self.apply_adapter_update(
-            SharedModel.MAIN_ADAPTER,
-            main_records,
-            self.replay_batch(SharedModel.MAIN_ADAPTER),
-        )
+        sub_updates = 0
+        if self.train_sub:
+            sub_updates = self.apply_adapter_update(
+                SharedModel.SUB_ADAPTER,
+                sub_records,
+                self.replay_batch(SharedModel.SUB_ADAPTER),
+            )
+        main_updates = 0
+        if self.train_main:
+            main_updates = self.apply_adapter_update(
+                SharedModel.MAIN_ADAPTER,
+                main_records,
+                self.replay_batch(SharedModel.MAIN_ADAPTER),
+            )
         return main_updates, sub_updates
 
     @staticmethod
@@ -456,6 +464,7 @@ class PlancraftMASGRPOTrainer:
             f"[plancraft-mas-grpo] replay_path={self.sft_replay_path} "
             f"replay_per_group={self.sft_replay_per_group} replay_weight={self.sft_replay_weight}"
         )
+        print(f"[plancraft-mas-grpo] train_main={self.train_main} train_sub={self.train_sub}")
         self.model = SharedModel(self.config.base_model, self.config)
         self.model.load_sft_weights()
         self.load_replay_samples()
@@ -564,6 +573,8 @@ def parse_args():
     parser.add_argument("--eval-repetition-penalty", type=float, default=1.05)
     parser.add_argument("--eval-max-steps", type=int, default=10)
     parser.add_argument("--eval-seed", type=int, default=123)
+    parser.add_argument("--train-main", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--train-sub", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=123)
     return parser.parse_args()
 
@@ -615,6 +626,8 @@ def main():
         eval_repetition_penalty=args.eval_repetition_penalty,
         eval_max_steps=args.eval_max_steps,
         eval_seed=args.eval_seed,
+        train_main=args.train_main,
+        train_sub=args.train_sub,
     ).train(train_examples, val_examples, iterations=args.iterations)
 
 

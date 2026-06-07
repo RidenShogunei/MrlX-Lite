@@ -2686,3 +2686,83 @@ objective. It should reduce the effective RL update strength, for example:
   - increase SFT replay weight/count,
   - or update Main only while freezing Sub as a controlled ablation.
 ```
+
+## Low-Strength Main-Only vs Joint GRPO Ablation
+
+Changed:
+```text
+grpo_plancraft_mas.py
+```
+
+Added:
+```text
+--train-main / --no-train-main
+--train-sub / --no-train-sub
+```
+
+A frozen adapter still participates in rollout generation, but receives neither
+GRPO loss nor SFT replay updates.
+
+Common settings:
+```text
+init = structured SFT200
+train_offset = 200
+train_tasks = 20
+val_tasks = 20
+iterations = 1
+group_size = 4
+lr = 3e-9
+advantage_clip = 0.2
+reward_gap_threshold = 0.02
+sft_replay_per_group = 4
+sft_replay_weight = 0.3
+aligned low-temperature validation = true
+```
+
+Main-only:
+```text
+train_main = true
+train_sub = false
+
+val:init success = 0.550
+train success = 0.350
+optimizer steps main/sub = 20 / 0
+val success after update = 0.250
+val invalid_action_rate = 0.062
+```
+
+Joint:
+```text
+train_main = true
+train_sub = true
+
+val:init success = 0.550
+train success = 0.300
+optimizer steps main/sub = 20 / 20
+val success after update = 0.250
+val invalid_action_rate = 0.056
+```
+
+Interpretation:
+```text
+Main-only and joint training produce essentially the same held-out degradation.
+Freezing Sub does not protect validation success.
+
+This localizes the primary failure to the Main policy update rather than to
+joint Main/Sub credit assignment. Even with:
+  - 10x lower learning rate,
+  - smaller advantage clipping,
+  - four replay samples per group,
+  - and stronger replay weighting,
+
+the Main update moves the policy away from the strong SFT solution.
+
+Both runs are rejected by aligned validation, so best/ remains the SFT200
+initialization. Running easy100 on the rejected step checkpoints is unnecessary
+for checkpoint selection.
+
+The next technical priority is to replace the weighted-SFT surrogate with a
+proper policy-ratio GRPO objective using stored rollout log probabilities and a
+reference/old policy. The current negative-weight cross-entropy update is only a
+rough approximation and is now the most likely algorithmic bottleneck.
+```
