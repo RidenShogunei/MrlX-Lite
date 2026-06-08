@@ -9,6 +9,23 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
+def clipped_grpo_objective(
+    current_logprobs,
+    old_logprobs,
+    reference_logprobs,
+    advantage: float,
+    policy_clip: float,
+    kl_beta: float,
+):
+    ratio = torch.exp((current_logprobs - old_logprobs).clamp(min=-20.0, max=20.0))
+    clipped_ratio = ratio.clamp(1.0 - policy_clip, 1.0 + policy_clip)
+    advantage_tensor = torch.full_like(ratio, float(advantage))
+    policy_loss = -torch.minimum(ratio * advantage_tensor, clipped_ratio * advantage_tensor).mean()
+    reference_gap = (reference_logprobs - current_logprobs).clamp(min=-20.0, max=20.0)
+    kl = (torch.exp(reference_gap) - reference_gap - 1.0).mean()
+    return policy_loss + float(kl_beta) * kl, policy_loss, kl
+
+
 @dataclass
 class CoTrainConfig:
     base_model: str = "/home/jinxu/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B"
@@ -30,6 +47,7 @@ class CoTrainConfig:
 class SharedModel:
     MAIN_ADAPTER = "main"
     SUB_ADAPTER = "sub"
+    REFERENCE_SUFFIX = "_reference"
 
     def __init__(self, base_model: str, config: CoTrainConfig):
         self.config = config
@@ -78,11 +96,23 @@ class SharedModel:
                         adapter_name=adapter_name,
                         is_trainable=True,
                     )
+                self.model.load_adapter(
+                    path,
+                    adapter_name=self.reference_adapter(adapter_name),
+                    is_trainable=False,
+                )
             elif isinstance(self.model, PeftModel):
                 self.model.add_adapter(adapter_name, lora_config)
             else:
                 self.model = get_peft_model(self.model, lora_config, adapter_name=adapter_name)
             self.ensure_optimizer(adapter_name)
+
+    @classmethod
+    def reference_adapter(cls, adapter_name: str) -> str:
+        return f"{adapter_name}{cls.REFERENCE_SUFFIX}"
+
+    def has_adapter(self, adapter_name: str) -> bool:
+        return adapter_name in getattr(self.model, "peft_config", {})
 
     def set_trainable_adapter(self, adapter_name: str):
         self.model.set_adapter(adapter_name)
@@ -160,6 +190,113 @@ class SharedModel:
             return 0.0
         loss.backward()
         return float(loss.detach().cpu())
+
+    def response_token_logprobs(
+        self,
+        adapter_name: str,
+        prompt: str,
+        response: str,
+        with_grad: bool = False,
+    ):
+        self.model.set_adapter(adapter_name)
+        text = prompt + response + (self.tokenizer.eos_token or "")
+        encoding = self.tokenizer(
+            text,
+            truncation=True,
+            max_length=self.config.max_train_length,
+            return_tensors="pt",
+        ).to(self.config.device)
+        prompt_encoding = self.tokenizer(
+            prompt,
+            truncation=True,
+            max_length=self.config.max_train_length,
+            add_special_tokens=False,
+            return_tensors="pt",
+        )
+        prompt_len = min(prompt_encoding["input_ids"].shape[-1], encoding["input_ids"].shape[-1])
+        context = torch.enable_grad() if with_grad else torch.no_grad()
+        self.model.eval()
+        with context:
+            logits = self.model(**encoding).logits[:, :-1, :]
+            labels = encoding["input_ids"][:, 1:]
+            token_logprobs = torch.log_softmax(logits, dim=-1).gather(
+                dim=-1,
+                index=labels.unsqueeze(-1),
+            ).squeeze(-1)
+            positions = torch.arange(1, encoding["input_ids"].shape[-1], device=self.config.device)
+            response_mask = positions >= prompt_len
+            selected = token_logprobs[0, response_mask]
+        return selected if with_grad else selected.detach().cpu()
+
+    def grpo_backward(
+        self,
+        adapter_name: str,
+        prompt: str,
+        response: str,
+        old_logprobs,
+        reference_logprobs,
+        advantage: float,
+        policy_clip: float = 0.2,
+        kl_beta: float = 0.01,
+        weight: float = 1.0,
+    ) -> dict:
+        if abs(advantage) <= 1e-8 or weight <= 0:
+            return {
+                "loss": 0.0,
+                "policy_loss": 0.0,
+                "kl": 0.0,
+                "ratio": 1.0,
+                "clip_fraction": 0.0,
+                "tokens": 0,
+            }
+        self.set_trainable_adapter(adapter_name)
+        current = self.response_token_logprobs(adapter_name, prompt, response, with_grad=True)
+        old = old_logprobs.to(current.device)
+        reference = reference_logprobs.to(current.device)
+        token_count = min(current.numel(), old.numel(), reference.numel())
+        if token_count == 0:
+            return {
+                "loss": 0.0,
+                "policy_loss": 0.0,
+                "kl": 0.0,
+                "ratio": 1.0,
+                "clip_fraction": 0.0,
+                "tokens": 0,
+            }
+        current = current[:token_count]
+        old = old[:token_count]
+        reference = reference[:token_count]
+
+        objective, policy_loss, kl = clipped_grpo_objective(
+            current,
+            old,
+            reference,
+            advantage=advantage,
+            policy_clip=policy_clip,
+            kl_beta=kl_beta,
+        )
+        loss = objective * float(weight)
+        if not torch.isfinite(loss):
+            return {
+                "loss": 0.0,
+                "policy_loss": 0.0,
+                "kl": 0.0,
+                "ratio": 1.0,
+                "clip_fraction": 0.0,
+                "tokens": 0,
+            }
+        loss.backward()
+        with torch.no_grad():
+            ratio = torch.exp((current - old).clamp(min=-20.0, max=20.0))
+            clipped = (ratio < 1.0 - policy_clip) | (ratio > 1.0 + policy_clip)
+        return {
+            "loss": float(loss.detach().cpu()),
+            "policy_loss": float(policy_loss.detach().cpu()),
+            "kl": float(kl.detach().cpu()),
+            "ratio": float(ratio.mean().detach().cpu()),
+            "clip_fraction": float(clipped.float().mean().detach().cpu()),
+            "tokens": int(token_count),
+        }
 
     def optimizer_zero_grad(self, adapter_name: str):
         self.optimizers[adapter_name].zero_grad(set_to_none=True)

@@ -40,6 +40,7 @@ plancraft_mas_sft_*/
 plancraft_mas_structured_sft_*/
 plancraft_mas_structured_short_sft_*/
 plancraft_mas_grpo_*/
+plancraft_mas_true_grpo_*/
 
 # Evaluation output directories; summaries are captured in reports
 hotpotqa_*_eval_*/

@@ -70,6 +70,9 @@ class PlancraftMASGRPOTrainer:
         eval_seed: int = 123,
         train_main: bool = True,
         train_sub: bool = True,
+        policy_clip: float = 0.2,
+        kl_beta: float = 0.01,
+        policy_epochs: int = 2,
     ):
         self.config = config
         self.max_steps = max_steps
@@ -101,6 +104,9 @@ class PlancraftMASGRPOTrainer:
         self.eval_seed = eval_seed
         self.train_main = train_main
         self.train_sub = train_sub
+        self.policy_clip = policy_clip
+        self.kl_beta = kl_beta
+        self.policy_epochs = max(policy_epochs, 1)
         self.replay_samples = {SharedModel.MAIN_ADAPTER: [], SharedModel.SUB_ADAPTER: []}
         self.save_dir = Path(config.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -209,8 +215,34 @@ class PlancraftMASGRPOTrainer:
                 structured=self.structured_sub,
                 evaluation=evaluation,
             )
+            sub_old_logprobs = None
+            sub_reference_logprobs = None
+            if not evaluation:
+                sub_old_logprobs = self.model.response_token_logprobs(
+                    SharedModel.SUB_ADAPTER,
+                    sub_prompt,
+                    sub_raw,
+                )
+                sub_reference_logprobs = self.model.response_token_logprobs(
+                    self.model.reference_adapter(SharedModel.SUB_ADAPTER),
+                    sub_prompt,
+                    sub_raw,
+                )
             main_prompt = self.build_main_prompt(observation, history, sub_raw)
             main_raw = self.generate_action(SharedModel.MAIN_ADAPTER, main_prompt, evaluation=evaluation)
+            main_old_logprobs = None
+            main_reference_logprobs = None
+            if not evaluation:
+                main_old_logprobs = self.model.response_token_logprobs(
+                    SharedModel.MAIN_ADAPTER,
+                    main_prompt,
+                    main_raw,
+                )
+                main_reference_logprobs = self.model.response_token_logprobs(
+                    self.model.reference_adapter(SharedModel.MAIN_ADAPTER),
+                    main_prompt,
+                    main_raw,
+                )
             sub_action = extract_structured_action(sub_raw) if self.structured_sub else sub_raw
             sub_norm = normalize_action(sub_action)
             main_norm = normalize_action(main_raw)
@@ -239,6 +271,10 @@ class PlancraftMASGRPOTrainer:
                     "main_prompt": main_prompt,
                     "main_raw": main_raw,
                     "oracle_action": oracle_action,
+                    "sub_old_logprobs": sub_old_logprobs,
+                    "sub_reference_logprobs": sub_reference_logprobs,
+                    "main_old_logprobs": main_old_logprobs,
+                    "main_reference_logprobs": main_reference_logprobs,
                 }
             )
             history.append((sub_raw, main_raw, observation))
@@ -318,34 +354,67 @@ class PlancraftMASGRPOTrainer:
         count = min(self.sft_replay_per_group, len(samples))
         return random.sample(samples, count)
 
-    def apply_adapter_update(self, adapter_name: str, records, replay_records) -> int:
+    def apply_adapter_update(self, adapter_name: str, records, replay_records) -> tuple[int, dict]:
         if not records and not replay_records:
-            return 0
-        self.model.optimizer_zero_grad(adapter_name)
-        backward_count = 0
-        rollout_scale = 1.0 / max(len(records), 1)
-        for prompt, response, advantage in records:
-            loss = self.model.sft_backward(
-                adapter_name,
-                prompt,
-                response,
-                weight=advantage * rollout_scale,
-            )
-            backward_count += 1 if loss != 0.0 else 0
-        replay_scale = self.sft_replay_weight / max(len(replay_records), 1)
-        for prompt, response in replay_records:
-            loss = self.model.sft_backward(
-                adapter_name,
-                prompt,
-                response,
-                weight=replay_scale,
-            )
-            backward_count += 1 if loss != 0.0 else 0
-        if backward_count == 0:
+            return 0, {
+                "policy_loss": 0.0,
+                "kl": 0.0,
+                "ratio": 1.0,
+                "clip_fraction": 0.0,
+                "tokens": 0,
+            }
+        policy_loss_total = 0.0
+        kl_total = 0.0
+        ratio_total = 0.0
+        clip_fraction_total = 0.0
+        policy_records = 0
+        token_total = 0
+        optimizer_steps = 0
+        for _epoch in range(self.policy_epochs):
             self.model.optimizer_zero_grad(adapter_name)
-            return 0
-        self.model.optimizer_step(adapter_name)
-        return 1
+            backward_count = 0
+            rollout_scale = 1.0 / max(len(records), 1)
+            for prompt, response, old_logprobs, reference_logprobs, advantage in records:
+                stats = self.model.grpo_backward(
+                    adapter_name,
+                    prompt,
+                    response,
+                    old_logprobs,
+                    reference_logprobs,
+                    advantage=advantage,
+                    policy_clip=self.policy_clip,
+                    kl_beta=self.kl_beta,
+                    weight=rollout_scale,
+                )
+                if stats["tokens"] > 0:
+                    backward_count += 1
+                    policy_records += 1
+                    policy_loss_total += stats["policy_loss"]
+                    kl_total += stats["kl"]
+                    ratio_total += stats["ratio"]
+                    clip_fraction_total += stats["clip_fraction"]
+                    token_total += stats["tokens"]
+            replay_scale = self.sft_replay_weight / max(len(replay_records), 1)
+            for prompt, response in replay_records:
+                loss = self.model.sft_backward(
+                    adapter_name,
+                    prompt,
+                    response,
+                    weight=replay_scale,
+                )
+                backward_count += 1 if loss != 0.0 else 0
+            if backward_count == 0:
+                self.model.optimizer_zero_grad(adapter_name)
+                continue
+            self.model.optimizer_step(adapter_name)
+            optimizer_steps += 1
+        return optimizer_steps, {
+            "policy_loss": policy_loss_total / max(policy_records, 1),
+            "kl": kl_total / max(policy_records, 1),
+            "ratio": ratio_total / max(policy_records, 1),
+            "clip_fraction": clip_fraction_total / max(policy_records, 1),
+            "tokens": token_total,
+        }
 
     def apply_advantage_update(self, candidates):
         main_records = []
@@ -355,24 +424,42 @@ class PlancraftMASGRPOTrainer:
             sub_adv = cand["sub_advantage"]
             for step in cand["steps"]:
                 if abs(sub_adv) >= self.min_advantage:
-                    sub_records.append((step["sub_prompt"], step["sub_raw"], sub_adv))
+                    sub_records.append(
+                        (
+                            step["sub_prompt"],
+                            step["sub_raw"],
+                            step["sub_old_logprobs"],
+                            step["sub_reference_logprobs"],
+                            sub_adv,
+                        )
+                    )
                 if abs(main_adv) >= self.min_advantage:
-                    main_records.append((step["main_prompt"], step["main_raw"], main_adv))
+                    main_records.append(
+                        (
+                            step["main_prompt"],
+                            step["main_raw"],
+                            step["main_old_logprobs"],
+                            step["main_reference_logprobs"],
+                            main_adv,
+                        )
+                    )
         sub_updates = 0
+        sub_stats = {"policy_loss": 0.0, "kl": 0.0, "ratio": 1.0, "clip_fraction": 0.0, "tokens": 0}
         if self.train_sub:
-            sub_updates = self.apply_adapter_update(
+            sub_updates, sub_stats = self.apply_adapter_update(
                 SharedModel.SUB_ADAPTER,
                 sub_records,
                 self.replay_batch(SharedModel.SUB_ADAPTER),
             )
         main_updates = 0
+        main_stats = {"policy_loss": 0.0, "kl": 0.0, "ratio": 1.0, "clip_fraction": 0.0, "tokens": 0}
         if self.train_main:
-            main_updates = self.apply_adapter_update(
+            main_updates, main_stats = self.apply_adapter_update(
                 SharedModel.MAIN_ADAPTER,
                 main_records,
                 self.replay_batch(SharedModel.MAIN_ADAPTER),
             )
-        return main_updates, sub_updates
+        return main_updates, sub_updates, main_stats, sub_stats
 
     @staticmethod
     def average(rows, key: str) -> float:
@@ -465,6 +552,10 @@ class PlancraftMASGRPOTrainer:
             f"replay_per_group={self.sft_replay_per_group} replay_weight={self.sft_replay_weight}"
         )
         print(f"[plancraft-mas-grpo] train_main={self.train_main} train_sub={self.train_sub}")
+        print(
+            f"[plancraft-mas-grpo] policy_clip={self.policy_clip} "
+            f"kl_beta={self.kl_beta} policy_epochs={self.policy_epochs}"
+        )
         self.model = SharedModel(self.config.base_model, self.config)
         self.model.load_sft_weights()
         self.load_replay_samples()
@@ -487,12 +578,26 @@ class PlancraftMASGRPOTrainer:
             print(f"\n===== Plancraft MAS GRPO Iter {it + 1}/{iterations} =====")
             rows = []
             main_updates, sub_updates = 0, 0
+            main_policy_losses, sub_policy_losses = [], []
+            main_kls, sub_kls = [], []
+            main_ratios, sub_ratios = [], []
+            main_clip_fractions, sub_clip_fractions = [], []
             for example in train_examples:
                 candidates = self.run_group(example)
                 rows.append(candidates[0])
-                u_main, u_sub = self.apply_advantage_update(candidates)
+                u_main, u_sub, main_stats, sub_stats = self.apply_advantage_update(candidates)
                 main_updates += u_main
                 sub_updates += u_sub
+                if main_stats["tokens"]:
+                    main_policy_losses.append(main_stats["policy_loss"])
+                    main_kls.append(main_stats["kl"])
+                    main_ratios.append(main_stats["ratio"])
+                    main_clip_fractions.append(main_stats["clip_fraction"])
+                if sub_stats["tokens"]:
+                    sub_policy_losses.append(sub_stats["policy_loss"])
+                    sub_kls.append(sub_stats["kl"])
+                    sub_ratios.append(sub_stats["ratio"])
+                    sub_clip_fractions.append(sub_stats["clip_fraction"])
             print(
                 f"  train success={self.average(rows, 'success'):.3f} "
                 f"main_reward={self.average(rows, 'main_reward'):.3f} "
@@ -504,7 +609,15 @@ class PlancraftMASGRPOTrainer:
                 f"sub_oracle={self.average(rows, 'sub_oracle_match'):.3f} "
                 f"progress={self.average(rows, 'oracle_progress'):.3f} "
                 f"agree={self.average(rows, 'sub_main_agreement'):.3f} "
-                f"updates main={main_updates} sub={sub_updates}"
+                f"updates main={main_updates} sub={sub_updates} "
+                f"policy_loss main={sum(main_policy_losses) / max(len(main_policy_losses), 1):.4f} "
+                f"sub={sum(sub_policy_losses) / max(len(sub_policy_losses), 1):.4f} "
+                f"kl main={sum(main_kls) / max(len(main_kls), 1):.6f} "
+                f"sub={sum(sub_kls) / max(len(sub_kls), 1):.6f} "
+                f"ratio main={sum(main_ratios) / max(len(main_ratios), 1):.4f} "
+                f"sub={sum(sub_ratios) / max(len(sub_ratios), 1):.4f} "
+                f"clip_frac main={sum(main_clip_fractions) / max(len(main_clip_fractions), 1):.4f} "
+                f"sub={sum(sub_clip_fractions) / max(len(sub_clip_fractions), 1):.4f}"
             )
             val = self.evaluate(val_examples)
             print(
@@ -575,6 +688,9 @@ def parse_args():
     parser.add_argument("--eval-seed", type=int, default=123)
     parser.add_argument("--train-main", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--train-sub", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--policy-clip", type=float, default=0.2)
+    parser.add_argument("--kl-beta", type=float, default=0.01)
+    parser.add_argument("--policy-epochs", type=int, default=2)
     parser.add_argument("--seed", type=int, default=123)
     return parser.parse_args()
 
@@ -628,6 +744,9 @@ def main():
         eval_seed=args.eval_seed,
         train_main=args.train_main,
         train_sub=args.train_sub,
+        policy_clip=args.policy_clip,
+        kl_beta=args.kl_beta,
+        policy_epochs=args.policy_epochs,
     ).train(train_examples, val_examples, iterations=args.iterations)
 
 
