@@ -9,51 +9,12 @@ import torch
 
 from analyze_hotpotqa_mas_results import build_prompt, load_model, set_adapter
 from plancraft_environment import PlancraftBenchEpisode, load_examples
-
-
-SUB_SYSTEM = (
-    "You are a Plancraft sub agent. Inspect the current objective, inventory, and action history.\n"
-    "Suggest exactly one next low-level action that may help craft the target.\n"
-    "Valid action formats are:\n"
-    "move: from [Source] to [Target] with quantity N\n"
-    "smelt: from [Source] to [Target] with quantity N\n"
-    "impossible: short reason\n"
-    "Slots include [A1]-[C3], [I1]-[I36], and output slot [0]."
+from plancraft_prompts import (
+    MAIN_SYSTEM,
+    STRUCTURED_SUB_SYSTEM,
+    SUB_SYSTEM,
+    history_text,
 )
-
-STRUCTURED_SUB_SYSTEM = (
-    "You are a Plancraft sub agent. Inspect the current objective, inventory, and action history.\n"
-    "Give structured guidance for the main agent.\n"
-    "Output exactly this format:\n"
-    "<subgoal>local crafting goal</subgoal>\n"
-    "<reason>brief reason based on the current state</reason>\n"
-    "<action>one recommended low-level action</action>\n"
-    "Valid action formats inside <action> are:\n"
-    "move: from [Source] to [Target] with quantity N\n"
-    "smelt: from [Source] to [Target] with quantity N\n"
-    "impossible: short reason\n"
-    "Slots include [A1]-[C3], [I1]-[I36], and output slot [0]."
-)
-
-MAIN_SYSTEM = (
-    "You are a Plancraft main agent. Use the sub agent advice, but output exactly one executable action.\n"
-    "Valid action formats are:\n"
-    "move: from [Source] to [Target] with quantity N\n"
-    "smelt: from [Source] to [Target] with quantity N\n"
-    "impossible: short reason\n"
-    "Do not output explanations after the action."
-)
-
-
-def history_text(history: list[tuple[str, str, str]]) -> str:
-    if not history:
-        return "No actions yet."
-    lines = []
-    for idx, (advice, action, observation) in enumerate(history, 1):
-        lines.append(f"Step {idx} sub advice: {advice}")
-        lines.append(f"Step {idx} main action: {action}")
-        lines.append(f"Step {idx} observation: {observation}")
-    return "\n".join(lines[-18:])
 
 
 def truncate_generation(text: str, structured: bool = False) -> str:

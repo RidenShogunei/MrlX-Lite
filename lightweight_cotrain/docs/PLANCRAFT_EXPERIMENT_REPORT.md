@@ -597,3 +597,79 @@ grpo_plancraft_mas.py
 - strict Main-only 完整对照；
 - strict GRPO easy100 评测。由于 aligned easy20 已拒绝更新后的 checkpoint，
   当前没有必要将该 checkpoint 作为最终候选做大规模评测。
+
+## 12. Strict GRPO Failure Analysis And Step Credit
+
+统一 SFT、独立 evaluator 和 GRPO 的 history 协议为最近 3 步后，重新评估：
+
+| Model | Success | Avg steps | Invalid |
+|---|---:|---:|---:|
+| Structured SFT200 | 0.600 | 3.900 | 0.027 |
+| Strict joint step checkpoint | 0.400 | 5.900 | 0.102 |
+
+配对结果：
+
+```text
+SFT-only solves = 5
+RL-only solves = 1
+net regression = 4 / 20
+```
+
+主要失败模式：
+
+```text
+1. 应使用 crafting grid 时重复 smelt。
+2. 应 smelt 时把材料依次填入 crafting grid。
+3. slab 等配方使用错误的横向/纵向布局。
+4. 可解任务上过早输出 impossible。
+5. 执行合法但错误的动作直到 max_steps。
+6. Sub/Main 在失败步骤上的动作完全一致，Main 没有纠错。
+```
+
+失败轨迹中：
+
+```text
+SFT timeout = 2 / 8 failures
+strict joint timeout = 7 / 12 failures
+Sub/Main exact action agreement = 100%
+```
+
+因此问题不只是动作格式。旧 objective 将同一个 episode advantage 分配给轨迹中
+每一步，并额外奖励 Sub/Main agreement，容易强化错误动作模板。
+
+已改为 step-level credit：
+
+```text
+每步 Main/Sub 独立 reward
+terminal success 只奖励成功终止步
+oracle progress 奖励实际状态推进步
+invalid/no-progress 不能继承最终成功 credit
+重复动作单独惩罚
+错误 impossible 单独惩罚
+Sub/Main agreement 默认权重降为 0
+同一 step index 在 group 内计算 relative advantage
+```
+
+新增训练诊断：
+
+```text
+repeat rate
+incorrect-stop rate
+unique first-action rate
+Main/Sub zero-advantage rate
+```
+
+2-task、group-size 4 smoke：
+
+```text
+zero-advantage rate = 0.500
+Main/Sub optimizer steps = 2 / 2
+Main policy loss = 0.0008
+Sub policy loss = 0.0016
+Sub KL = 0.000180
+validation success = 1.000 -> 1.000
+```
+
+这验证了新的 step-level strict GRPO 链路可以在有 reward 差异的步骤上更新，同时
+跳过没有区分度的步骤。正式实验仍需从同一 SFT checkpoint 运行
+Main-only、Sub-only 和 joint 对照。

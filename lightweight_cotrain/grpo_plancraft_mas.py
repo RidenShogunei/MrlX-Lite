@@ -9,9 +9,9 @@ from pathlib import Path
 import torch
 
 from analyze_hotpotqa_mas_results import build_prompt
-from analyze_plancraft_mas_results import MAIN_SYSTEM, STRUCTURED_SUB_SYSTEM, SUB_SYSTEM, history_text
 from grpo_v4 import CoTrainConfig, SharedModel
 from plancraft_environment import PlancraftBenchEpisode, flatten_subplans, load_examples
+from plancraft_prompts import MAIN_SYSTEM, STRUCTURED_SUB_SYSTEM, SUB_SYSTEM, history_text
 
 
 def first_line(text: str) -> str:
@@ -57,6 +57,8 @@ class PlancraftMASGRPOTrainer:
         sub_oracle_weight: float = 0.5,
         sub_progress_weight: float = 0.6,
         sub_agreement_weight: float = 0.2,
+        repeat_action_penalty: float = 0.2,
+        incorrect_stop_penalty: float = 0.5,
         structured_sub: bool = False,
         reward_gap_threshold: float = 0.02,
         sft_replay_path: str | None = None,
@@ -91,6 +93,8 @@ class PlancraftMASGRPOTrainer:
         self.sub_oracle_weight = sub_oracle_weight
         self.sub_progress_weight = sub_progress_weight
         self.sub_agreement_weight = sub_agreement_weight
+        self.repeat_action_penalty = repeat_action_penalty
+        self.incorrect_stop_penalty = incorrect_stop_penalty
         self.structured_sub = structured_sub
         self.reward_gap_threshold = max(reward_gap_threshold, 0.0)
         self.sft_replay_path = sft_replay_path
@@ -174,27 +178,42 @@ class PlancraftMASGRPOTrainer:
         return normalize_action(action) == normalize_action(oracle_action)
 
     def candidate_rewards(self, result, step_scores) -> tuple[float, float]:
-        success = 1.0 if result.success else 0.0
-        main_valid = self.average(step_scores, "main_valid")
-        main_oracle = self.average(step_scores, "main_oracle_match")
-        progress = self.average(step_scores, "oracle_progress")
-        sub_valid = self.average(step_scores, "sub_valid")
-        sub_oracle = self.average(step_scores, "sub_oracle_match")
-        sub_agreement = self.average(step_scores, "sub_main_agreement")
+        return (
+            sum(score["main_step_reward"] for score in step_scores),
+            sum(score["sub_step_reward"] for score in step_scores),
+        )
+
+    def step_rewards(
+        self,
+        *,
+        main_valid: float,
+        sub_valid: float,
+        main_oracle: float,
+        sub_oracle: float,
+        progress: float,
+        agreement: float,
+        repeated_action: float,
+        terminal_success: float,
+        incorrect_stop: float,
+    ) -> tuple[float, float]:
         main_reward = (
-            self.main_success_weight * success
+            self.main_success_weight * terminal_success
             + self.main_valid_weight * main_valid
             + self.main_oracle_weight * main_oracle
             + self.main_progress_weight * progress
-            - self.step_penalty * result.steps
+            - self.repeat_action_penalty * repeated_action
+            - self.incorrect_stop_penalty * incorrect_stop
+            - self.step_penalty
         )
         sub_reward = (
-            self.sub_global_weight * success
+            self.sub_global_weight * terminal_success
             + self.sub_valid_weight * sub_valid
             + self.sub_oracle_weight * sub_oracle
             + self.sub_progress_weight * progress
-            + self.sub_agreement_weight * sub_agreement
-            - self.step_penalty * result.steps
+            + self.sub_agreement_weight * agreement
+            - self.repeat_action_penalty * repeated_action
+            - self.incorrect_stop_penalty * incorrect_stop
+            - self.step_penalty
         )
         return main_reward, sub_reward
 
@@ -203,6 +222,7 @@ class PlancraftMASGRPOTrainer:
         episode = PlancraftBenchEpisode(example, max_steps=max_steps)
         observation = episode.reset()
         history = []
+        previous_main_actions = set()
         steps = []
         step_scores = []
         for _step in range(max_steps):
@@ -254,16 +274,37 @@ class PlancraftMASGRPOTrainer:
             progress = 0.0
             if main_valid and oracle_steps_before > 0:
                 progress = max(min((oracle_steps_before - oracle_steps_after) / oracle_steps_before, 1.0), -1.0)
-            step_scores.append(
-                {
-                    "sub_valid": sub_valid,
-                    "main_valid": main_valid,
-                    "sub_oracle_match": 1.0 if sub_norm and sub_norm == oracle_norm else 0.0,
-                    "main_oracle_match": 1.0 if main_norm and main_norm == oracle_norm else 0.0,
-                    "sub_main_agreement": 1.0 if sub_norm and sub_norm == main_norm else 0.0,
-                    "oracle_progress": progress,
-                }
+            sub_oracle_match = 1.0 if sub_norm and sub_norm == oracle_norm else 0.0
+            main_oracle_match = 1.0 if main_norm and main_norm == oracle_norm else 0.0
+            agreement = 1.0 if sub_norm and sub_norm == main_norm else 0.0
+            repeated_action = 1.0 if main_norm and main_norm in previous_main_actions else 0.0
+            terminal_success = 1.0 if terminated and bool(episode.wrapper.success) else 0.0
+            incorrect_stop = 1.0 if terminated and not terminal_success and main_norm.startswith("impossible:") else 0.0
+            main_step_reward, sub_step_reward = self.step_rewards(
+                main_valid=main_valid,
+                sub_valid=sub_valid,
+                main_oracle=main_oracle_match,
+                sub_oracle=sub_oracle_match,
+                progress=progress,
+                agreement=agreement,
+                repeated_action=repeated_action,
+                terminal_success=terminal_success,
+                incorrect_stop=incorrect_stop,
             )
+            score = {
+                "sub_valid": sub_valid,
+                "main_valid": main_valid,
+                "sub_oracle_match": sub_oracle_match,
+                "main_oracle_match": main_oracle_match,
+                "sub_main_agreement": agreement,
+                "oracle_progress": progress,
+                "repeated_action": repeated_action,
+                "terminal_success": terminal_success,
+                "incorrect_stop": incorrect_stop,
+                "main_step_reward": main_step_reward,
+                "sub_step_reward": sub_step_reward,
+            }
+            step_scores.append(score)
             steps.append(
                 {
                     "sub_prompt": sub_prompt,
@@ -275,8 +316,11 @@ class PlancraftMASGRPOTrainer:
                     "sub_reference_logprobs": sub_reference_logprobs,
                     "main_old_logprobs": main_old_logprobs,
                     "main_reference_logprobs": main_reference_logprobs,
+                    **score,
                 }
             )
+            if main_norm:
+                previous_main_actions.add(main_norm)
             history.append((sub_raw, main_raw, observation))
             if terminated or truncated:
                 break
@@ -300,6 +344,8 @@ class PlancraftMASGRPOTrainer:
             "sub_oracle_match": self.average(step_scores, "sub_oracle_match"),
             "sub_main_agreement": self.average(step_scores, "sub_main_agreement"),
             "oracle_progress": self.average(step_scores, "oracle_progress"),
+            "repeat_rate": self.average(step_scores, "repeated_action"),
+            "incorrect_stop_rate": self.average(step_scores, "incorrect_stop"),
         }
 
     def group_advantages(self, candidates, reward_key: str, advantage_key: str):
@@ -321,8 +367,43 @@ class PlancraftMASGRPOTrainer:
         candidates = [self.generate_candidate(example) for _ in range(self.config.group_size)]
         self.group_advantages(candidates, "main_reward", "main_advantage")
         self.group_advantages(candidates, "sub_reward", "sub_advantage")
+        self.assign_step_advantages(candidates, "main_step_reward", "main_step_advantage")
+        self.assign_step_advantages(candidates, "sub_step_reward", "sub_step_advantage")
+        first_actions = [normalize_action(candidate["steps"][0]["main_raw"]) for candidate in candidates if candidate["steps"]]
+        unique_actions = len(set(first_actions))
+        main_step_advantages = [
+            abs(step.get("main_step_advantage", 0.0)) for candidate in candidates for step in candidate["steps"]
+        ]
+        sub_step_advantages = [
+            abs(step.get("sub_step_advantage", 0.0)) for candidate in candidates for step in candidate["steps"]
+        ]
+        for candidate in candidates:
+            candidate["group_unique_first_action_rate"] = unique_actions / max(len(first_actions), 1)
+            candidate["main_zero_advantage_rate"] = sum(
+                advantage < self.min_advantage for advantage in main_step_advantages
+            ) / max(len(main_step_advantages), 1)
+            candidate["sub_zero_advantage_rate"] = sum(
+                advantage < self.min_advantage for advantage in sub_step_advantages
+            ) / max(len(sub_step_advantages), 1)
         candidates.sort(key=lambda cand: (cand["main_reward"], cand["success"], cand["valid_rate"]), reverse=True)
         return candidates
+
+    def assign_step_advantages(self, candidates, reward_key: str, advantage_key: str):
+        max_steps = max((len(candidate["steps"]) for candidate in candidates), default=0)
+        for step_index in range(max_steps):
+            available = [candidate["steps"][step_index] for candidate in candidates if step_index < len(candidate["steps"])]
+            values = [step[reward_key] for step in available]
+            reward_gap = max(values) - min(values) if values else 0.0
+            if len(values) < 2 or reward_gap < self.reward_gap_threshold:
+                for step in available:
+                    step[advantage_key] = 0.0
+                continue
+            mean = sum(values) / len(values)
+            variance = sum((value - mean) ** 2 for value in values) / len(values)
+            std = max(variance**0.5, 1e-6)
+            for step, value in zip(available, values):
+                advantage = (value - mean) / std
+                step[advantage_key] = max(min(advantage, self.advantage_clip), -self.advantage_clip)
 
     def load_replay_samples(self):
         if not self.sft_replay_path or self.sft_replay_per_group <= 0:
@@ -420,9 +501,9 @@ class PlancraftMASGRPOTrainer:
         main_records = []
         sub_records = []
         for cand in candidates:
-            main_adv = cand["main_advantage"]
-            sub_adv = cand["sub_advantage"]
             for step in cand["steps"]:
+                main_adv = step.get("main_step_advantage", 0.0)
+                sub_adv = step.get("sub_step_advantage", 0.0)
                 if abs(sub_adv) >= self.min_advantage:
                     sub_records.append(
                         (
@@ -501,6 +582,8 @@ class PlancraftMASGRPOTrainer:
             "sub_oracle_match": self.average(rows, "sub_oracle_match"),
             "sub_main_agreement": self.average(rows, "sub_main_agreement"),
             "oracle_progress": self.average(rows, "oracle_progress"),
+            "repeat_rate": self.average(rows, "repeat_rate"),
+            "incorrect_stop_rate": self.average(rows, "incorrect_stop_rate"),
             "avg_steps": self.average(rows, "step_count"),
         }
 
@@ -537,6 +620,10 @@ class PlancraftMASGRPOTrainer:
             f"sub=(global:{self.sub_global_weight}, valid:{self.sub_valid_weight}, "
             f"oracle:{self.sub_oracle_weight}, progress:{self.sub_progress_weight}, "
             f"agree:{self.sub_agreement_weight})"
+        )
+        print(
+            f"[plancraft-mas-grpo] step penalties repeat={self.repeat_action_penalty} "
+            f"incorrect_stop={self.incorrect_stop_penalty}"
         )
         print(
             f"[plancraft-mas-grpo] eval_samples={self.eval_samples} "
@@ -609,6 +696,11 @@ class PlancraftMASGRPOTrainer:
                 f"sub_oracle={self.average(rows, 'sub_oracle_match'):.3f} "
                 f"progress={self.average(rows, 'oracle_progress'):.3f} "
                 f"agree={self.average(rows, 'sub_main_agreement'):.3f} "
+                f"repeat={self.average(rows, 'repeat_rate'):.3f} "
+                f"incorrect_stop={self.average(rows, 'incorrect_stop_rate'):.3f} "
+                f"unique_first={self.average(rows, 'group_unique_first_action_rate'):.3f} "
+                f"zero_adv main={self.average(rows, 'main_zero_advantage_rate'):.3f} "
+                f"sub={self.average(rows, 'sub_zero_advantage_rate'):.3f} "
                 f"updates main={main_updates} sub={sub_updates} "
                 f"policy_loss main={sum(main_policy_losses) / max(len(main_policy_losses), 1):.4f} "
                 f"sub={sum(sub_policy_losses) / max(len(sub_policy_losses), 1):.4f} "
@@ -674,7 +766,9 @@ def parse_args():
     parser.add_argument("--sub-valid-weight", type=float, default=0.3)
     parser.add_argument("--sub-oracle-weight", type=float, default=0.5)
     parser.add_argument("--sub-progress-weight", type=float, default=0.6)
-    parser.add_argument("--sub-agreement-weight", type=float, default=0.2)
+    parser.add_argument("--sub-agreement-weight", type=float, default=0.0)
+    parser.add_argument("--repeat-action-penalty", type=float, default=0.2)
+    parser.add_argument("--incorrect-stop-penalty", type=float, default=0.5)
     parser.add_argument("--structured-sub", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--reward-gap-threshold", type=float, default=0.02)
     parser.add_argument("--sft-replay-path", default=None)
@@ -731,6 +825,8 @@ def main():
         sub_oracle_weight=args.sub_oracle_weight,
         sub_progress_weight=args.sub_progress_weight,
         sub_agreement_weight=args.sub_agreement_weight,
+        repeat_action_penalty=args.repeat_action_penalty,
+        incorrect_stop_penalty=args.incorrect_stop_penalty,
         structured_sub=args.structured_sub,
         reward_gap_threshold=args.reward_gap_threshold,
         sft_replay_path=args.sft_replay_path,
